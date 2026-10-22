@@ -4,7 +4,6 @@
 
 > *Making AI research available to everyone. Screw NVIDIA and their overpriced GPUs.*
 > *NOTE: This software is experimental, it may or may not work for you out of the box, you will have to get your hands dirty with python*
-> *NOTE: RCO AND GSQ ARE CURRENTLY BROKEN*
 
 TOFFEE is an all-in-one, hardware-aware toolkit for fine-tuning, quantizing, and deploying large language models — optimized for Qwen3.5-MoE hybrid architectures, but flexible enough for any model. It handles the three domains that matter:
 
@@ -69,6 +68,11 @@ python -m toffee merge \
 
 ### Quantization
 
+`toffee quant run-all` runs the full pipeline in one call: it prepares a
+calibration dataset, harvests an importance matrix (imatrix) by streaming
+the model layer by layer, exports an F16 GGUF, and quantizes it with
+llama.cpp's own quantizer under an APEX tensor-type map.
+
 ```bash
 # Full quantization pipeline with imatrix
 python -m toffee quant run-all \
@@ -78,12 +82,35 @@ python -m toffee quant run-all \
   --gguf-quant Q4_K_M
 ```
 
-Tiers: `quality`, `balanced`, `compact`, `mini`, `nano`
+**What the flags do**
 
-#### Tiers: two axes, not a size ladder
+| Flag | Meaning |
+|------|---------|
+| `--tier` | The APEX policy that decides the quant type per tensor role. One of `quality`, `balanced`, `compact`, `mini`, `nano`. |
+| `--samples` | Number of calibration rows for the imatrix. 256 is a good default; more costs time and helps the quality-dependent types. |
+| `--gguf-quant` | The K-quant the bulk of the model is rounded to (e.g. `Q4_K_M`, `Q8_0`). |
+| `--vram-limit` | VRAM cap in GB. TOFFEE streams layers so it runs below the model size; lower the cap to go further. |
+| `--streaming` | Force layer-by-layer streaming even when the model would fit in VRAM. |
+| `--split-max-size 4G` | Write the F16 GGUF as shards so a 71 GB intermediate never exists as one file. `llama-quantize` reads the shards directly. |
+| `--no-imatrix` | Skip the imatrix harvest. Only valid for tiers that do not need it (`balanced`, `compact`). |
+| `--tensor-type-file PATH` | Use a hand-written llama.cpp tensor-type file instead of the APEX map. |
+| `--batch-size` | Per-batch row count for the imatrix harvest pass. |
 
-The tiers optimize **quality** and **decode speed**, and the size follows from
-that. They are deliberately *not* monotonic in size:
+**Which tier should I pick?**
+
+- **`quality`** — best quality per byte. Uses IQ/TQ types in the bulk, so it
+  needs an imatrix and pays a decode tax. Pick this when the model sits on
+  disk and you care about fidelity.
+- **`balanced`** — no imatrix tax, K-quants only. Deliberately *bigger* than
+  `quality`. Pick this when the model is decoded continuously (served, not
+  loaded once): the tax you save beats the extra gigabytes.
+- **`compact`** — small *and* fast. K-quants only, no tax. Pick this when
+  VRAM or disk is the binding constraint and you still want decent speed.
+- **`mini` / `nano`** — the smallest footprints. IQ types in the bulk, so
+  they need an imatrix. Pick these only when nothing else fits.
+
+The tiers optimize **quality** and **decode speed**, and the size follows
+from that. They are deliberately *not* monotonic in size:
 
 | tier | quality | decode | imatrix tax | ~bpw | ~GB (36B MoE) | what it is for |
 |------|---------|--------|-------------|------|---------------|----------------|
@@ -104,11 +131,27 @@ python -m toffee quant tiers
 python -m toffee quant tiers --json
 ```
 
-### Quantization Refinements (RCO + GSQ)
+#### Tiers are a policy, not a quantizer
+
+The tier decides *which quant type each tensor role gets*. The actual
+rounding is delegated to llama.cpp's own `llama-quantize` through a ctypes
+bridge, so what TOFFEE produces is a plain GGUF that llama.cpp loads
+unchanged. The output of `run-all` is a single quantized GGUF plus the
+imatrix and tensor-type file it used — every intermediate is written to the
+output directory and resumable via `state.json`.
+
+### Quantization Refinements (RCO + GSQ) — **BROKEN**
+
+> **RCO and GSQ are currently broken and not usable.** The `toffee quant rco`
+> and `toffee quant gsq` subcommands exist in the CLI and the code lives in
+> `toffee/quant/rco.py` and `toffee/quant/gsq.py`, but neither produces a
+> working result today. Do not rely on them. The `run-all` pipeline does not
+> use either engine — it quantizes with the APEX tier map and llama.cpp's own
+> quantizer only.
 
 The APEX tier stays the **policy**: it decides which quant type each tensor
-role gets. Two optional engines refine it *underneath* the tier — the tier is
-never displaced, only sharpened.
+role gets. Two optional engines were meant to refine it *underneath* the
+tier — the tier is never displaced, only sharpened. Both are parked.
 
 **RCO — exactly budget-constrained mixed precision.** Keeps the tier's
 per-role quant family as the option set and searches over it on the *budget
@@ -117,7 +160,7 @@ lands on the target size exactly instead of approximately. The output is
 still a plain llama.cpp `--tensor-type-file`.
 
 ```bash
-# Give the experts a precision ladder and fit the model to a size budget
+# BROKEN — do not run
 python -m toffee quant --model ./Apodex-1.1-mini --output-dir ./toffee-quant-output \
   --tier quality \
   rco --target-size-gb 6.0 \
@@ -132,7 +175,7 @@ integer scale fields. The file stays a valid GGUF that llama.cpp loads
 unchanged — only the numbers inside change.
 
 ```bash
-# Refine a quantized GGUF in place (needs the f16 GGUF and the imatrix)
+# BROKEN — do not run
 python -m toffee quant gsq \
   --gguf ./toffee-quant-output/model-TOFFEE-quality-Q4_K_M.gguf \
   --f16-gguf ./toffee-quant-output/model-f16.gguf \
@@ -141,7 +184,7 @@ python -m toffee quant gsq \
 ```
 
 Measured against llama.cpp's own quantizer on the same importance matrix
-(64×512 weights, weighted reconstruction error):
+(64x512 weights, weighted reconstruction error):
 
 | type | error reduction |
 |------|-----------------|
@@ -185,10 +228,9 @@ disk — are handled by streaming:
 | Pass 2 (imatrix) | The model is streamed **layer by layer**: one layer's weights are resident at a time, and the hidden states pass between layers through CPU RAM. |
 | F16 export | `--split-max-size 4G` writes a **split** GGUF, so a 71 GB intermediate never exists as one file. `llama-quantize` reads the shards directly. |
 | Pass 3 (quantize) | `llama-quantize` memory-maps the F16 input, so it does not need it in RAM. |
-| GSQ refinement | Streamed **by block**, with a bounded working set per tensor, and resumable via `--state` / `--resume`. |
 
 ```bash
-# A 67GB MoE on a 12GB GPU: F16 (split) -> imatrix -> RCO -> Q4_K_M
+# A 67GB MoE on a 12GB GPU: F16 (split) -> imatrix -> Q4_K_M
 bash run_sage_quant.sh
 
 # or by hand
@@ -196,55 +238,16 @@ python -m toffee quant --model ./Sage-A1.5 --output-dir ./sage-out \
   --vram-limit 8 --samples 256 --batch-size 32 --streaming
 
 python -m toffee quant --model ./Sage-A1.5 --output-dir ./sage-out \
-  --gguf-quant Q4_K_M --split-max-size 4G \
-  --tensor-type-file ./sage-out/tensor-type-file-quality-rco.txt
+  --gguf-quant Q4_K_M --split-max-size 4G
 ```
 
 > **Disk:** the F16 export and the quantized output must both fit. For a
 > 67 GB model that is ~71 GB + ~19 GB. Note that `/tmp` is often a small
 > tmpfs — put the output directory on the real disk.
 
-> **The RCO map is applied.** Pass 3 prefers
-> `tensor-type-file-{tier}-rco.txt` when it exists, so the per-role quant
-> types RCO chose under the budget are the ones llama-quantize uses.
-
-#### GSQ is a refinement, and it is opt-in
-
-GSQ re-learns the codes and scales of an already-quantized model. It is
-**not** part of the quantization pipeline: it is a separate, explicit step.
-
-It is also **slow on a large model**. Measured on Sage-A1.5 (36B, 33B of
-routed expert parameters):
-
-| type | elements | time | gain |
-|------|----------|------|------|
-| IQ4_XS | 33.0B | ~22 h | +1.44% error |
-| Q4_K | 1.2B | ~1.9 h | +1.55% error |
-| Q6_K | 0.1B | ~0.5 h | +2.81% error |
-
-That is ~24 hours for a ~1.4% reconstruction-error gain, so it is opt-in in
-`run_sage_quant.sh` (`GSQ=1`) and always bounded by a time budget:
-
-```bash
-# Opt in, with a 2-hour cap. The run checkpoints per block, so it can be
-# resumed and it stops cleanly when the budget is used up.
-GSQ=1 GSQ_MAX_TENSORS=0 bash run_sage_quant.sh
-
-# or directly
-python -m toffee quant gsq \
-  --gguf ./sage-out/Sage-A1.5-TOFFEE-quality-Q4_K_M.gguf \
-  --f16-gguf ./sage-out/Sage-A1.5-f16.gguf \
-  --imatrix ./sage-out/imatrix.dat \
-  --time-budget-minutes 120 \
-  --state ./sage-out/gsq-state.json --resume
-```
-
-> **The Gumbel-Softmax relaxation is off by default** (`--epochs 0`). It was
-> measured to contribute exactly **0%** — llama.cpp's own code assignment is
-> already optimal given its scales, and the scale search subsumes it. On
-> real Sage-A1.5 weights, `epochs=8` and `epochs=0` give the same error to
-> 10 decimal places, with `epochs=8` taking ~45% longer. Pass `--epochs 8`
-> to run it anyway.
+> **The APEX map is applied.** Pass 3 uses `tensor-type-file-{tier}.txt`
+> (the tier's own APEX map). The RCO-refined variant
+> `tensor-type-file-{tier}-rco.txt` is not used, because RCO is broken.
 
 ### Speculative Decoding (XSpark)
 
@@ -284,8 +287,8 @@ Gradient checkpointing is auto-enabled under 24GB. You can override anything wit
 | `toffee merge` | Weighted multi-adapter merge |
 | `toffee export` | Merge + GGUF export |
 | `toffee quant run-all` | Imatrix + APEX GGUF quantization |
-| `toffee quant rco` | Budget-constrained refinement of the APEX tier map |
-| `toffee quant gsq` | In-format Gumbel-Softmax refinement of a quantized GGUF |
+| `toffee quant rco` | Budget-constrained refinement of the APEX tier map — **BROKEN** |
+| `toffee quant gsq` | In-format Gumbel-Softmax refinement of a quantized GGUF — **BROKEN** |
 | `toffee xspark prepare` | Fetch calibration datasets |
 | `toffee xspark harvest` | Extract teacher activations |
 | `toffee xspark train` | Train XSpark draft head |
@@ -391,6 +394,11 @@ layer, the output remains a GGUF that llama.cpp loads unchanged, and the
 quantization itself is delegated to llama.cpp's own quantizer through
 `toffee/quant/ggml_bridge.py`.
 
+> **Both engines are currently broken** — see the "Quantization Refinements"
+> section above. The adaptations are still in place in
+> `toffee/quant/rco.py` and `toffee/quant/gsq.py`, but they do not produce a
+> working result today.
+
 `toffee/quant/hybrid_model.py` is adapted from the ONYX quantization engine's
 minimal hybrid text model (`_MinimalHybridDecoderLayer` /
 `_MinimalHybridTextModel`), which solves the same problem for the same
@@ -399,6 +407,8 @@ imatrix harvesting when the exact `transformers` classes are unavailable.
 
 > The layer-streaming design — one layer resident at a time, hidden states
 > passed between layers through CPU RAM — follows ONYX's pass 2.
+
+- *APEX* — What my refinement was built on <https://github.com/localai-org/apex-quant>
 
 ---
 
