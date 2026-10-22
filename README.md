@@ -4,6 +4,7 @@
 
 > *Making AI research available to everyone. Screw NVIDIA and their overpriced GPUs.*
 > *NOTE: This software is experimental, it may or may not work for you out of the box, you will have to get your hands dirty with python*
+> *NOTE: RCO AND GSQ ARE CURRENTLY BROKEN*
 
 TOFFEE is an all-in-one, hardware-aware toolkit for fine-tuning, quantizing, and deploying large language models — optimized for Qwen3.5-MoE hybrid architectures, but flexible enough for any model. It handles the three domains that matter:
 
