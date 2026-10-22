@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--tier", type=str, default="quality", choices=["quality", "balanced", "compact", "mini", "nano"])
     p_all.add_argument("--no-imatrix", action="store_true")
     p_all.add_argument("--gguf-quant", type=str, default="Q4_K_M")
+    p_all.add_argument(
+        "--split-max-size", type=str, default=None,
+        help="Split the F16 GGUF into shards of this size (e.g. '4G'). "
+             "Needed for models too large for the disk in one file.",
+    )
     p_all.add_argument(
         "--llama-cpp", type=str, default=None,
         help="Path to a llama.cpp checkout (default: ./llama.cpp)",
@@ -504,6 +510,42 @@ def _run_quant_all(args, output_dir: Path) -> None:
     split_max_size = getattr(args, "split_max_size", None)
     explicit_tensor_type = getattr(args, "tensor_type_file", None)
 
+    # Step 0: Convert safetensors → F16 GGUF (so pass2 can size imatrix
+    # entries to llama.cpp's exact tensor dimensions for this arch).
+    base_name = Path(model_name).name
+    safe_name = base_name.replace("/", "-")
+    f16_gguf_path = output_dir / f"{safe_name}-f16.gguf"
+    if not f16_gguf_path.exists():
+        logger.info("quant_f16_convert_start", model=model_name, split=split_max_size)
+        convert_cmd = [
+            sys.executable, "./llama.cpp/convert_hf_to_gguf.py",
+            str(model_name),
+            "--outtype", "f16",
+            "--outfile", str(f16_gguf_path),
+        ]
+        if split_max_size:
+            convert_cmd += ["--split-max-size", str(split_max_size)]
+        convert_result = subprocess.run(
+            convert_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        if convert_result.returncode != 0:
+            logger.error(
+                "quant_f16_convert_failed",
+                returncode=convert_result.returncode,
+                stdout=convert_result.stdout,
+            )
+            raise RuntimeError(
+                f"convert_hf_to_gguf.py failed with exit code "
+                f"{convert_result.returncode}:\n{convert_result.stdout}"
+            )
+        logger.info("quant_f16_convert_complete", path=str(f16_gguf_path))
+    else:
+        logger.info("quant_f16_convert_skip", msg="F16 GGUF already present.")
+
     # Pass 1: Prepare dataset
     data_dir = output_dir / "data"
     if state is None or state.last_completed_step != "dataset_prepared":
@@ -565,9 +607,6 @@ def _run_quant_all(args, output_dir: Path) -> None:
         logger.info("quant_pass2_skip", msg="Imatrix already complete.")
 
     # Pass 3: Quantize
-    base_name = Path(model_name).name
-    safe_name = base_name.replace("/", "-")
-    f16_gguf_path = output_dir / f"{safe_name}-f16.gguf"
     tensor_type_path = output_dir / f"tensor-type-file-{tier}.txt"
     output_path = output_dir / f"{safe_name}-TOFFEE-{tier}-{gguf_quant}.gguf"
     # The RCO-refined map, if the RCO step has been run for this tier.
