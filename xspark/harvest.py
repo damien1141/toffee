@@ -128,9 +128,15 @@ def stream_and_harvest(
 
     gpu = get_gpu_info()
     if gpu:
-        logger.info("harvest_gpu_detected", name=gpu.name, vram=gpu.total_memory_gb)
+        logger.info(
+            "harvest_gpu_detected",
+            extra={"gpu_name": gpu.name, "vram": gpu.total_memory_gb},
+        )
     else:
-        logger.warning("harvest_no_gpu", msg="Harvest will be slow on CPU")
+        logger.warning(
+            "harvest_no_gpu",
+            extra={"reason": "Harvest will be slow on CPU"},
+        )
 
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
     num_hidden_layers = getattr(config, "num_hidden_layers", None)

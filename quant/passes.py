@@ -153,37 +153,69 @@ def pass2_harvest(
             return self.model.named_buffers()
 
     if _model_type in ("qwen3_5_moe", "qwen3_5_moe_text"):
-        from transformers.models.qwen3_5_moe import (
-            Qwen3_5MoeTextModel,
-            Qwen3_5MoeTextConfig,
+        from toffee.quant.hybrid_model import (
+            MinimalHybridTextModel,
+            TextModelShim,
         )
+
         text_cfg = (
             config.text_config
             if _model_type == "qwen3_5_moe"
             else config
         )
-        if not isinstance(text_cfg, Qwen3_5MoeTextConfig):
-            text_cfg = Qwen3_5MoeTextConfig.from_dict(text_cfg.to_dict())
+        # The exact `transformers.models.qwen3_5_moe` classes only exist in
+        # newer transformers releases. When they are missing, fall back to
+        # the minimal hybrid model, which declares the same module hierarchy
+        # (and the same weight shapes) as the real thing.
+        try:
+            from transformers.models.qwen3_5_moe import (
+                Qwen3_5MoeTextModel,
+                Qwen3_5MoeTextConfig,
+            )
 
-        with init_empty_weights():
-            _text = Qwen3_5MoeTextModel(text_cfg)
-        model = _TextModelShim(_text)
+            if not isinstance(text_cfg, Qwen3_5MoeTextConfig):
+                text_cfg = Qwen3_5MoeTextConfig.from_dict(text_cfg.to_dict())
+            with init_empty_weights():
+                _text = Qwen3_5MoeTextModel(text_cfg)
+        except Exception as exc:
+            logger.info(
+                "pass2_minimal_hybrid_model",
+                model_type=_model_type,
+                reason=str(exc)[:200],
+            )
+            with init_empty_weights():
+                _text = MinimalHybridTextModel(text_cfg)
+        model = TextModelShim(_text)
     elif _model_type in ("qwen3_5", "qwen3_5_text"):
-        from transformers.models.qwen3_5 import (
-            Qwen3_5TextModel,
-            Qwen3_5TextConfig,
+        from toffee.quant.hybrid_model import (
+            MinimalHybridTextModel,
+            TextModelShim,
         )
+
         text_cfg = (
             config.text_config
             if _model_type == "qwen3_5"
             else config
         )
-        if not isinstance(text_cfg, Qwen3_5TextConfig):
-            text_cfg = Qwen3_5TextConfig.from_dict(text_cfg.to_dict())
+        try:
+            from transformers.models.qwen3_5 import (
+                Qwen3_5TextModel,
+                Qwen3_5TextConfig,
+            )
 
-        with init_empty_weights():
-            _text = Qwen3_5TextModel(text_cfg)
-        model = _TextModelShim(_text)
+            if not isinstance(text_cfg, Qwen3_5TextConfig):
+                text_cfg = Qwen3_5TextConfig.from_dict(text_cfg.to_dict())
+            with init_empty_weights():
+                _text = Qwen3_5TextModel(text_cfg)
+        except Exception as exc:
+            logger.info(
+                "pass2_minimal_hybrid_model",
+                model_type=_model_type,
+                reason=str(exc)[:200],
+            )
+            with init_empty_weights():
+                _text = MinimalHybridTextModel(text_cfg)
+        model = TextModelShim(_text)
     else:
         with init_empty_weights():
             model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
@@ -333,12 +365,22 @@ def pass2_harvest(
 
         inject_prefix = layer_prefix if layer_prefix else prefix
         inject_weights(layer_module, layer_weights, inject_prefix)
+        # Keep the per-tensor output widths before the weights are released:
+        # the dense imatrix entries are sized from them.
+        layer_out_feats = {
+            k: int(v.shape[1]) for k, v in layer_weights.items()
+            if hasattr(v, "shape") and len(v.shape) == 2
+        }
         del layer_weights
 
         # Router hook
         num_experts = get_num_experts(config)
         layer_router_probs = torch.zeros(num_experts)
         def router_hook(module, inputs, output):
+            # `nonlocal` is required: an augmented assignment rebinds the name,
+            # which would otherwise make it local to this closure and raise
+            # UnboundLocalError on the first call.
+            nonlocal layer_router_probs
             if isinstance(output, torch.Tensor):
                 probs = torch.softmax(output.float(), dim=-1)
                 layer_router_probs += probs.sum(dim=tuple(range(probs.dim()-1))).cpu()
@@ -500,9 +542,9 @@ def pass2_harvest(
         def _dense_numel(gguf_name: str) -> Optional[int]:
             suffix = gguf_name[len(f"blk.{layer_idx}."):] if gguf_name.startswith(f"blk.{layer_idx}.") else gguf_name
             pat = re.compile(re.escape(suffix) + r"\.weight$")
-            for k, v in layer_weights.items():
+            for k, v in layer_out_feats.items():
                 if pat.search(k):
-                    return int(v.shape[1])
+                    return int(v)
             if gguf_name in gguf_sizes:
                 g = gguf_sizes[gguf_name]
                 if isinstance(g, (list, tuple)) and len(g) == 2:
@@ -615,9 +657,12 @@ def pass2_harvest(
             writer.add_entry(
                 ImatrixEntry(name, _fallback_dim, [100.0] * _fallback_dim, ncall=0)
             )
-            logger.info("imatrix_fallback_added", name=name, dim=_fallback_dim)
+            logger.info(
+                "imatrix_fallback_added",
+                extra={"tensor_name": name, "dim": _fallback_dim},
+            )
         else:
-            logger.info("imatrix_fallback_present", name=name)
+            logger.info("imatrix_fallback_present", extra={"tensor_name": name})
 
     if writer.entries:
         writer.write()
@@ -634,11 +679,26 @@ def pass3_quantize(
     output_path: Path,
     f16_gguf_path: Path,
     use_imatrix: bool = True,
+    split_max_size: Optional[str] = None,
 ) -> None:
     """
     Shell out to mainline llama-quantize.
 
     Passes --imatrix and --tensor-type-file when use_imatrix is True.
+
+    For a model too large for the disk in one file, ``split_max_size`` (e.g.
+    ``"8G"``) makes the F16 export a *split* GGUF. llama-quantize reads the
+    split shards directly and writes a split output, so the intermediate F16
+    never has to exist as one huge file.
+
+    Args:
+        model_path: the source model directory.
+        imatrix_path: the imatrix, if any.
+        tensor_type_path: the llama.cpp tensor-type file.
+        output_path: the quantized output path.
+        f16_gguf_path: the F16 GGUF (or its first shard) to quantize from.
+        use_imatrix: whether to pass --imatrix.
+        split_max_size: optional shard size, e.g. ``"8G"``.
     """
     import logging
     logger = logging.getLogger(__name__)
@@ -649,6 +709,7 @@ def pass3_quantize(
         tensor_type=tensor_type_path,
         output=output_path,
         use_imatrix=use_imatrix,
+        split_max_size=split_max_size,
     )
 
     if not f16_gguf_path.exists():
@@ -658,6 +719,8 @@ def pass3_quantize(
             "--outtype", "f16",
             "--outfile", str(f16_gguf_path),
         ]
+        if split_max_size:
+            convert_cmd += ["--split-max-size", str(split_max_size)]
         logger.info("pass3_convert_start", cmd=" ".join(convert_cmd))
         convert_result = subprocess.run(
             convert_cmd,
@@ -687,7 +750,10 @@ def pass3_quantize(
     elif use_imatrix:
         logger.warning(
             "pass3_no_imatrix_skip",
-            msg="--imatrix requested but imatrix.dat missing; quantizing without it.",
+            extra={
+                "reason": "--imatrix requested but imatrix.dat missing; "
+                "quantizing without it."
+            },
         )
 
     logger.info("pass3_quantize_cmd", cmd=" ".join(cmd))

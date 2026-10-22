@@ -186,7 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # quant
     p_quant = subparsers.add_parser("quant", help="Quantization: imatrix + GGUF export")
-    _add_common_args(p_quant)
+    # `--model` is not needed by `quant gsq`, which refines an existing GGUF,
+    # so it is checked by the handler rather than by argparse.
+    p_quant.add_argument("--model", type=str, default=None, help="Base model name or path")
+    p_quant.add_argument("--output-dir", type=str, default="toffee-output", help="Output directory")
+    p_quant.add_argument("--vram-limit", type=float, default=None, help="VRAM limit in GB (optional)")
     p_quant.add_argument("--dataset", type=str, default="el4/bartowski-imatrix-v5-semantic-parquet")
     p_quant.add_argument("--dataset-split", type=str, default="train")
     p_quant.add_argument("--text-field", type=str, default="text")
@@ -198,6 +202,72 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant.add_argument("--tier", type=str, default="quality", choices=["quality", "balanced", "compact", "mini", "nano"])
     p_quant.add_argument("--no-imatrix", action="store_true")
     p_quant.add_argument("--gguf-quant", type=str, default="Q4_K_M")
+    p_quant.add_argument(
+        "--split-max-size", type=str, default=None,
+        help="Split the F16 GGUF into shards of this size (e.g. '4G'). "
+             "Needed for models too large for the disk in one file.",
+    )
+    p_quant.add_argument(
+        "--tensor-type-file", type=str, default=None,
+        help="Use this llama.cpp tensor-type file instead of the APEX map.",
+    )
+
+    # quant rco / gsq
+    p_quant_sub = p_quant.add_subparsers(dest="quant_command")
+    p_quant_rco = p_quant_sub.add_parser(
+        "rco",
+        help="Refine the APEX tier's quant map under an exact size budget",
+    )
+    p_quant_rco.add_argument(
+        "--experimental", action="store_true",
+        help="Acknowledge that RCO is parked: measured against APEX on a "
+             "same-family model it was +2.53% worse, and a quality win is "
+             "still not demonstrated. Without this flag the subcommand "
+             "refuses to run.",
+    )
+    p_quant_rco.add_argument("--target-size-gb", type=float, default=None,
+                             help="Target model size in GB. Defaults to the tier's own size.")
+    p_quant_rco.add_argument("--ladder", type=str, action="append", default=None,
+                             help="Role ladder, e.g. 'experts=Q6_K,Q5_K,Q4_K'. Repeatable.")
+    p_quant_rco.add_argument("--no-measure", action="store_true",
+                             help="Skip measuring each role's distortion")
+    p_quant_rco.add_argument("--sample-rows", type=int, default=256,
+                             help="Rows sampled per tensor for the measurement")
+    p_quant_rco.add_argument("--llama-cpp", type=str, default=None)
+    p_quant_gsq = p_quant_sub.add_parser(
+        "gsq",
+        help="Refine a quantized GGUF's codes and scales in place (Gumbel-Softmax)",
+    )
+    p_quant_gsq.add_argument("--gguf", type=str, required=True,
+                             help="The quantized GGUF to refine")
+    p_quant_gsq.add_argument("--f16-gguf", type=str, required=True,
+                             help="The f16 GGUF with the original weights")
+    p_quant_gsq.add_argument("--imatrix", type=str, default=None,
+                             help="Imatrix used to weight the objective")
+    p_quant_gsq.add_argument("--epochs", type=int, default=0,
+                             help="Gumbel-Softmax epochs per tensor (0 skips "
+                                  "the relaxation; the scale search does the work)")
+    p_quant_gsq.add_argument("--scale-passes", type=int, default=2,
+                             help="Scale coordinate-descent passes")
+    p_quant_gsq.add_argument("--max-tensors", type=int, default=None,
+                             help="Cap the number of tensors refined")
+    p_quant_gsq.add_argument("--seed", type=int, default=0)
+    p_quant_gsq.add_argument("--llama-cpp", type=str, default=None)
+    p_quant_gsq.add_argument("--chunk-blocks", type=int, default=2048,
+                             help="Blocks processed per chunk, to bound peak memory")
+    p_quant_gsq.add_argument("--state", type=str, default=None,
+                             help="Checkpoint file for per-block progress")
+    p_quant_gsq.add_argument("--resume", action="store_true",
+                             help="Resume from the checkpoint file")
+    p_quant_gsq.add_argument("--time-budget-minutes", type=float, default=None,
+                             help="Stop cleanly after this many minutes "
+                                  "(the work so far is checkpointed)")
+    p_quant_tiers = p_quant_sub.add_parser(
+        "tiers",
+        help="List the quant tiers: what they optimize and what they cost",
+    )
+    p_quant_tiers.add_argument("--json", action="store_true",
+                               help="Emit the tier table as JSON")
 
     # xspark
     p_xspark = subparsers.add_parser("xspark", help="XSpark speculative decoding draft model")
@@ -345,7 +415,13 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    if not args.model:
+    # `quant gsq` refines an existing GGUF and needs no model, and
+    # `quant tiers` only prints a table.
+    needs_model = not (
+        args.command == "quant"
+        and args.quant_command in ("gsq", "tiers")
+    )
+    if needs_model and not args.model:
         parser.error("--model is required")
 
     output_dir = Path(args.output_dir)

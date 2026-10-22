@@ -323,9 +323,15 @@ def train_xspark(
 
     gpu = get_gpu_info()
     if gpu:
-        logger.info("train_gpu_detected", name=gpu.name, vram=gpu.total_memory_gb)
+        logger.info(
+            "train_gpu_detected",
+            extra={"gpu_name": gpu.name, "vram": gpu.total_memory_gb},
+        )
     else:
-        logger.warning("train_no_gpu", msg="Training will be slow on CPU")
+        logger.warning(
+            "train_no_gpu",
+            extra={"reason": "Training will be slow on CPU"},
+        )
 
     # State / resume
     state = load_state(output_dir) if resume else None
