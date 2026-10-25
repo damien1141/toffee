@@ -10,9 +10,11 @@ import struct
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+import structlog
 import torch
 import torch.nn as nn
 
+logger = structlog.get_logger()
 
 class ActivationScaleCapturer:
     """PyTorch forward_pre_hook that captures activation scales for a module."""
@@ -81,8 +83,8 @@ class ActivationScaleCapturer:
             ncall=self._ncall,
         )
 
-
 @dataclass
+
 class ImatrixEntry:
     """An imatrix entry for a single tensor."""
     tensor_name: str
@@ -102,7 +104,6 @@ class ImatrixEntry:
         for val in self.squared_sums:
             data.extend(struct.pack("<f", val))
         return bytes(data)
-
 
 class ImatrixWriter:
     """Writes imatrix data as a GGUF-wrapped importance matrix.
@@ -131,8 +132,7 @@ class ImatrixWriter:
             import gguf as _gguf
             reader = _gguf.GGUFReader(str(self.output_path))
         except Exception as e:
-            import logging
-            logging.warning("imatrix_load_existing_failed", error=str(e))
+            logger.warning("imatrix_load_existing_failed", error=str(e))
             return
 
         loaded: List[ImatrixEntry] = []
@@ -203,8 +203,6 @@ class ImatrixWriter:
         if not self.entries:
             return
 
-        import logging
-        logger = logging.getLogger(__name__)
         appending = len(self.entries)
         logger.info(
             "imatrix_write_start",
@@ -228,3 +226,4 @@ class ImatrixWriter:
     def flush(self) -> None:
         """Alias for write()."""
         self.write()
+

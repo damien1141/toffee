@@ -488,6 +488,16 @@ def _run_gsq_refine(args) -> None:
         print(f"  checkpoint: {state_path}")
 
 
+def _imatrix_is_valid(path: Path) -> bool:
+    """Return True if `path` is a readable GGUF imatrix file."""
+    try:
+        import gguf as _gguf
+        _gguf.GGUFReader(str(path))
+        return True
+    except Exception:
+        return False
+
+
 def _run_quant_all(args, output_dir: Path) -> None:
     from toffee.data import load_batches_from_disk
 
@@ -577,7 +587,14 @@ def _run_quant_all(args, output_dir: Path) -> None:
         sys.exit(1)
 
     # Pass 2: Imatrix harvest
-    if state.last_completed_step != "imatrix_complete":
+    imatrix_path = output_dir / "imatrix.dat"
+    if state.last_completed_step != "imatrix_complete" and _imatrix_is_valid(imatrix_path):
+        logger.info(
+            "quant_pass2_skip",
+            msg="Clean imatrix.dat found from a previous quant; reusing it instead of re-harvesting.",
+        )
+        state.last_completed_step = "imatrix_complete"
+    elif state.last_completed_step != "imatrix_complete":
         logger.info("quant_pass2_start")
         last_layer = -1
         if state and state.last_completed_step.startswith("layer_"):
