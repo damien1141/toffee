@@ -35,7 +35,18 @@ class ActivationScaleCapturer:
         if not isinstance(x, torch.Tensor) or x.dim() < 2:
             return
         x = torch.nan_to_num(x.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        reduce_dims = tuple(range(x.dim() - 1))
+        # For a Linear the input is [B, ..., D] and the feature dim is the LAST
+        # dim, so summing over all-but-last gives a per-feature scale of length
+        # D (stable across batches). For a Conv1d/Conv2d/Conv3d the input is
+        # [B, C, *spatial] and the FEATURE dim is dim 1, while the spatial dims
+        # (incl. the last) vary with sequence length — summing over all-but-last
+        # there produced a per-T-length accumulation that crashed when T changed
+        # between batches. Reduce over (batch, *spatial) instead so the channel
+        # dim is stable.
+        if isinstance(module, (torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d)):
+            reduce_dims = (0,) + tuple(range(2, x.dim()))
+        else:
+            reduce_dims = tuple(range(x.dim() - 1))
         sq = x.pow(2).sum(dim=reduce_dims).cpu()
         if self._accum is None:
             self._accum = sq

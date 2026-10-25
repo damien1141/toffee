@@ -190,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     # so it is checked by the handler rather than by argparse.
     p_quant.add_argument("--model", type=str, default=None, help="Base model name or path")
     p_quant.add_argument("--output-dir", type=str, default="toffee-output", help="Output directory")
-    p_quant.add_argument("--vram-limit", type=float, default=None, help="VRAM limit in GB (optional)")
+    p_quant.add_argument("--vram-limit", type=float, default=8.0, help="VRAM limit in GB (optional)")
     p_quant.add_argument("--dataset", type=str, default="el4/bartowski-imatrix-v5-semantic-parquet")
     p_quant.add_argument("--dataset-split", type=str, default="train")
     p_quant.add_argument("--text-field", type=str, default="text")

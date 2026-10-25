@@ -18,7 +18,7 @@ import structlog
 
 from toffee.config import AppState, DatasetConfig
 from toffee.data import prepare_dataset
-from toffee.hardware import get_gpu_info
+from toffee.hardware import clamp_vram_limit, get_gpu_info
 from toffee.quant.config import get_num_hidden_layers, load_config_with_fallback
 from toffee.quant.mapping import generate_dynamic_apex_tensor_map_from_gguf
 from toffee.quant.passes import pass2_harvest, pass3_quantize
@@ -501,7 +501,7 @@ def _run_quant_all(args, output_dir: Path) -> None:
         state = None
 
     model_name = args.model
-    vram_limit = args.vram_limit
+    vram_limit = clamp_vram_limit(args.vram_limit or 8.0)
     samples = args.samples
     batch_size = args.batch_size
     tier = args.tier
