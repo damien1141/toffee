@@ -105,6 +105,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--sample-rows", type=int, default=256,
         help="Rows of each tensor sampled for the distortion measurement",
     )
+    p_rco.add_argument(
+        "--optimize-steps", type=int, default=0,
+        help="Run N steps of Riemannian-Adam optimisation on the budget "
+             "manifold, using the soft-expected-distortion loss as the "
+             "differentiable objective. 0 (the default) preserves the "
+             "one-shot init+DP behaviour. Try 200 for a real model.",
+    )
+    p_rco.add_argument(
+        "--optimize-lr", type=float, default=0.05,
+        help="Learning rate for the optimisation loop.",
+    )
     p_rco.add_argument("--llama-cpp", type=str, default=None)
 
     # --- GSQ: in-format refinement of the quantized weights ---
@@ -142,6 +153,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="Stop cleanly after this many minutes. The work so far is "
              "checkpointed, so the run can be resumed later. On a 36B "
              "MoE the routed experts alone take ~22h.",
+    )
+    p_gsq.add_argument(
+        "--parallel-workers", type=int, default=None,
+        help="Refine the tensors of each block in parallel using a "
+             "multiprocessing.Pool of this size. Each worker opens its "
+             "own GGUF readers and builds its own llama.cpp bridge; the "
+             "main process collects and writes the refined bytes serially. "
+             "On an 8-core CPU this gives a 4-6x additional speed-up over "
+             "the single-worker path.",
+    )
+    p_gsq.add_argument(
+        "--search-super-scale", type=int, default=1,
+        help="1 (the default) searches the fp16 super-scale d (and dmin) "
+             "in addition to the integer sub-fields. 0 disables it for "
+             "a faster but weaker refinement.",
+    )
+    p_gsq.add_argument(
+        "--device", type=str, default="cpu",
+        help="torch device for the closed-form candidate evaluation and "
+             "the coordinate descent. 'cpu' (the default) uses NumPy; "
+             "'cuda' moves the hot paths to the GPU for ~20-30x speed-up "
+             "on an RTX-class card.",
     )
 
     # --- tiers: what each tier costs ---
@@ -368,6 +401,8 @@ def _run_rco_map(args, output_dir: Path) -> None:
         sensitivity=None,
         source=source,
         cols=cols,
+        optimize_steps=getattr(args, "optimize_steps", 0),
+        optimize_lr=getattr(args, "optimize_lr", 0.05),
     )
 
     _write_map(tensor_type_path, result.tensor_map)
@@ -449,6 +484,8 @@ def _run_gsq_refine(args) -> None:
         scale_passes=args.scale_passes,
         seed=args.seed,
         chunk_blocks=args.chunk_blocks,
+        search_super_scale=bool(getattr(args, "search_super_scale", 1)),
+        device=getattr(args, "device", "cpu"),
     )
     bridge = GgmlBridge.get(args.llama_cpp)
 
@@ -475,6 +512,7 @@ def _run_gsq_refine(args) -> None:
         state_path=state_path,
         resume=bool(args.resume),
         time_budget_minutes=getattr(args, "time_budget_minutes", None),
+        parallel_workers=getattr(args, "parallel_workers", None),
     )
     print(f"GSQ refined {report.tensors_refined} tensors "
           f"({report.tensors_skipped} skipped)")

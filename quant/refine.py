@@ -24,7 +24,9 @@ import json
 import logging
 import os
 import re
+import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -1360,23 +1362,77 @@ def _refine_tensor_worker(task):
             "raw_bytes_len": len(raw_bytes),
         }
     except Exception as exc:  # noqa: BLE001 - the main process handles failures
+        # Print the error directly so it shows up in the worker's stderr,
+        # not just in the return value. The main process logs it too, but
+        # structlog's `extra=` kwarg doesn't surface reliably across the
+        # multiprocessing boundary.
+        import traceback
+        print(
+            f"[gsq worker] refine_tensor FAILED for {name!r}:\n"
+            f"{type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}",
+            file=sys.stderr,
+            flush=True,
+        )
         return {
             "name": name,
             "ok": False,
-            "error": str(exc),
+            "error": f"{type(exc).__name__}: {exc}",
         }
+
+
+def _pool_initializer(parent_sys_path, parent_cwd):
+    """Run once per worker when it starts.
+
+    With ``spawn``, the worker is a fresh Python process that does NOT
+    inherit the parent's ``sys.path`` or cwd. If the parent imported
+    ``toffee`` from a source directory (e.g. via ``python -m toffee``
+    from the project root), the worker can't find ``toffee`` and the
+    spawn fails with ``ModuleNotFoundError: No module named 'toffee'``.
+
+    This initializer copies the parent's ``sys.path`` (minus the venv's
+    ``site-packages`` entries, which the worker already has) into the
+    worker's ``sys.path``, and chdir's to the parent's cwd so relative
+    paths in the GGUF reader resolve correctly.
+    """
+    import os
+    import sys
+    for p in parent_sys_path:
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    if parent_cwd:
+        try:
+            os.chdir(parent_cwd)
+        except OSError:
+            pass
 
 
 def _get_parallel_pool(n_workers: int):
     """Build a ``multiprocessing.Pool`` for tensor refinement.
 
-    Uses the default context (fork on Linux, spawn on macOS/Windows). The
-    pool is returned to the caller, which is responsible for closing it.
+    Uses the ``spawn`` start method on every platform. This is required
+    when the workers will touch CUDA: PyTorch raises
+    ``RuntimeError: Cannot re-initialize CUDA in forked subprocess`` if
+    the parent process has already initialised CUDA and the child is
+    forked. Spawn creates a fresh Python process that initialises CUDA
+    cleanly.
+
+    The cost of spawn vs fork: spawn re-imports every module in the
+    worker, which adds ~200 ms to the first task per worker. For a 36B
+    MoE with 28K tensors, that's amortised to nothing.
+
+    The pool is returned to the caller, which is responsible for closing
+    it.
     """
     import multiprocessing
-    # The default context works on all platforms. On Linux it forks, so
-    # the worker inherits the parent's imports (no re-import cost).
-    return multiprocessing.Pool(processes=n_workers)
+    import os
+    import sys
+    ctx = multiprocessing.get_context("spawn")
+    return ctx.Pool(
+        processes=n_workers,
+        initializer=_pool_initializer,
+        initargs=(sys.path[:], os.getcwd()),
+    )
 
 
 def _refine_block_parallel(
@@ -1448,9 +1504,12 @@ def _refine_block_parallel(
         type_name = task["type_name"]
         n_per_row = task["n_per_row"]
         if not result["ok"]:
+            # Use structlog-style kwargs (not stdlib `extra=`) so the
+            # error message actually surfaces in the JSON output.
             logger.warning(
                 "gsq_refine_failed",
-                extra={"tensor": name, "error": result.get("error", "")},
+                tensor=name,
+                error=result.get("error", ""),
             )
             report.tensors_skipped += 1
             continue
