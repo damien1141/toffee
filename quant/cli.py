@@ -177,6 +177,33 @@ def build_parser() -> argparse.ArgumentParser:
              "on an RTX-class card.",
     )
 
+    # --- ternary: f16 GGUF -> ternary GGUF with Hadamard rotation ---
+    p_ternary = subparsers.add_parser(
+        "ternary",
+        help="Convert an f16 GGUF to ternary (PTQ1_0/PQ2_0) with Hadamard rotation",
+    )
+    p_ternary.add_argument("--f16-gguf", type=str, required=True,
+                           help="The f16 GGUF with the original weights")
+    p_ternary.add_argument("--output", type=str, required=True,
+                           help="Output ternary GGUF path")
+    p_ternary.add_argument(
+        "--format", type=str, default="PTQ1_0", choices=["PTQ1_0", "PQ2_0"],
+        help="Ternary format: PTQ1_0 (1.75 bpw) or PQ2_0 (2.125 bpw)",
+    )
+    p_ternary.add_argument(
+        "--hadamard-block", type=int, default=1024,
+        help="Hadamard rotation block size (power of 2). 0 disables rotation.",
+    )
+    p_ternary.add_argument(
+        "--hadamard-seed", type=int, default=0,
+        help="RNG seed for the Hadamard sign pattern (must match at inference)",
+    )
+    p_ternary.add_argument("--max-tensors", type=int, default=None)
+    p_ternary.add_argument(
+        "--device", type=str, default="cpu",
+        help="torch device for the Hadamard rotation ('cuda' for GPU).",
+    )
+
     # --- tiers: what each tier costs ---
     p_tiers = subparsers.add_parser(
         "tiers",
@@ -207,6 +234,10 @@ def main(args: Optional[List[str]] = None) -> None:
     if command == "gsq":
         # The GSQ refinement works on an existing GGUF; it needs no model.
         _run_gsq_refine(parsed)
+        return
+
+    if command == "ternary":
+        _run_ternary_quantize(parsed)
         return
 
     if command == "tiers":
@@ -464,6 +495,37 @@ def _print_tiers(args) -> None:
     print("bigger than `quality` on purpose -- it avoids the IQ/TQ imatrix")
     print("decode tax, which is worth more than the extra gigabytes when the")
     print("model is decoded continuously.")
+
+
+def _run_ternary_quantize(args) -> None:
+    """Convert an f16 GGUF to ternary (PTQ1_0/PQ2_0) with Hadamard rotation."""
+    from toffee.quant.ternary.pipeline import TernaryConfig, quantize_gguf_to_ternary
+
+    f16_path = Path(args.f16_gguf)
+    out_path = Path(args.output)
+    if not f16_path.exists():
+        logger.error("ternary_missing_f16", msg=f"{f16_path} not found")
+        sys.exit(1)
+
+    config = TernaryConfig(
+        format=args.format,
+        hadamard_block_size=args.hadamard_block,
+        hadamard_seed=args.hadamard_seed,
+        device=getattr(args, "device", "cpu"),
+    )
+
+    report = quantize_gguf_to_ternary(
+        f16_gguf_path=f16_path,
+        output_path=out_path,
+        config=config,
+        max_tensors=args.max_tensors,
+    )
+    print(f"Ternary quantized {report.tensors_quantized} tensors "
+          f"({report.tensors_skipped} skipped, {report.tensors_rotated} rotated)")
+    if report.tensors_quantized:
+        print(f"  effective bpw: {report.effective_bpw:.4f}")
+        print(f"  output size: {report.output_bytes / 1e9:.2f} GB")
+    print(f"  output: {out_path}")
 
 
 def _run_gsq_refine(args) -> None:

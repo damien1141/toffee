@@ -296,6 +296,31 @@ def build_parser() -> argparse.ArgumentParser:
              "on an RTX-class card. The Gumbel-Softmax relaxation stays "
              "on CPU regardless.",
     )
+    p_quant_ternary = p_quant_sub.add_parser(
+        "ternary",
+        help="Convert an f16 GGUF to ternary (PTQ1_0/PQ2_0) with Hadamard rotation",
+    )
+    p_quant_ternary.add_argument("--f16-gguf", type=str, required=True,
+                                 help="The f16 GGUF with the original weights")
+    p_quant_ternary.add_argument("--output", type=str, required=True,
+                                 help="Output ternary GGUF path")
+    p_quant_ternary.add_argument(
+        "--format", type=str, default="PTQ1_0", choices=["PTQ1_0", "PQ2_0"],
+        help="Ternary format: PTQ1_0 (1.75 bpw, trit-packed) or PQ2_0 (2.125 bpw, 2-bit packed)",
+    )
+    p_quant_ternary.add_argument(
+        "--hadamard-block", type=int, default=1024,
+        help="Hadamard rotation block size (must be a power of 2). 0 disables rotation.",
+    )
+    p_quant_ternary.add_argument(
+        "--hadamard-seed", type=int, default=0,
+        help="RNG seed for the Hadamard +/-1 sign pattern (must match at inference)",
+    )
+    p_quant_ternary.add_argument("--max-tensors", type=int, default=None)
+    p_quant_ternary.add_argument(
+        "--device", type=str, default="cpu",
+        help="torch device for the Hadamard rotation ('cuda' for GPU, 'cpu' for NumPy).",
+    )
     p_quant_tiers = p_quant_sub.add_parser(
         "tiers",
         help="List the quant tiers: what they optimize and what they cost",
@@ -449,11 +474,11 @@ def main() -> None:
         parser.print_help()
         sys.exit(1)
 
-    # `quant gsq` refines an existing GGUF and needs no model, and
-    # `quant tiers` only prints a table.
+    # `quant gsq` and `quant ternary` work on existing GGUFs and need
+    # no model, and `quant tiers` only prints a table.
     needs_model = not (
         args.command == "quant"
-        and args.quant_command in ("gsq", "tiers")
+        and args.quant_command in ("gsq", "ternary", "tiers")
     )
     if needs_model and not args.model:
         parser.error("--model is required")
