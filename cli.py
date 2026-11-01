@@ -212,6 +212,25 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use this llama.cpp tensor-type file instead of the APEX map.",
     )
 
+    # amputate: no-training MoEfication (dense FFN -> sparse MoE)
+    p_amp = subparsers.add_parser(
+        "amputate",
+        help="No-training MoEfication: dense FFN -> sparse MoE (A12B preset)",
+    )
+    from toffee.amputate.cli import build_parser as _amp_build_parser
+    _amp_sub = p_amp.add_subparsers(dest="amputate_command")
+    _amp_dummy = _amp_build_parser()
+    # Reuse the amputate module's own subparser definitions verbatim.
+    for action in _amp_dummy._subparsers._group_actions[0].choices.items():
+        _name, _parser = action
+        _amp_sub.add_parser(
+            _name, parents=[_parser], add_help=False,
+            help=_parser.description,
+        )
+    p_amp.add_argument("--model", type=str, default=None,
+                       help="(only report/harvest/build)")
+    p_amp.add_argument("--output-dir", type=str, default="toffee-amputate-output")
+
     # quant rco / gsq
     p_quant_sub = p_quant.add_subparsers(dest="quant_command")
     p_quant_rco = p_quant_sub.add_parser(
@@ -467,6 +486,15 @@ def _build_alignment_config(args: argparse.Namespace) -> AlignmentConfig:
 
 
 def main() -> None:
+    # `toffee amputate canary-prep|canary-run` forwards its raw flags to
+    # the canary module CLI; bypass argparse entirely (REMAINDER quirk).
+    _argv = sys.argv[1:]
+    if len(_argv) >= 2 and _argv[0] == "amputate" and \
+            _argv[1] in ("canary-prep", "canary-run"):
+        from toffee.amputate.canary.__main__ import main as _canary_main
+        _sub = "prep" if _argv[1] == "canary-prep" else "run"
+        raise SystemExit(_canary_main([_sub] + _argv[2:]))
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -480,6 +508,10 @@ def main() -> None:
         args.command == "quant"
         and args.quant_command in ("gsq", "ternary", "tiers")
     )
+    # `amputate plan` / `selftest` / `verify` need no model.
+    if args.command == "amputate" and getattr(
+            args, "amputate_command", None) in ("plan", "selftest", "verify"):
+        needs_model = False
     if needs_model and not args.model:
         parser.error("--model is required")
 
@@ -493,6 +525,10 @@ def main() -> None:
         logger.warning("no_gpu_detected", msg="Training will be slow on CPU.")
 
     command = args.command
+
+    if command == "amputate":
+        from toffee.amputate.cli import run_args
+        raise SystemExit(run_args(args))
 
     if command == "prepare":
         dataset_config = _build_dataset_config(args)

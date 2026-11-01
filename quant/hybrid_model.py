@@ -20,6 +20,17 @@ This module therefore declares that hierarchy explicitly. The forward pass
 is a stand-in that flows data through every linear layer, so the hooks see
 real activations with the real shapes.
 
+The NORMALISATION layers are faithful to the real architecture (not a
+stand-in): zero-centred ``Qwen3_5RMSNorm`` semantics for the
+input/post-attention/q/k/final norms and a silu-gated plain-weight RMSNorm
+on the GDN value path. This matters beyond imatrix: ``toffee amputate``
+fits a per-layer router on the FFN input distribution this model produces
+when the real transformers classes are unavailable, so a skewed norm
+(earlier: every norm emulated as mean-subtracting ``nn.LayerNorm``) would
+silently bias the harvested router against the runtime distribution. The
+GDN recurrence itself remains a crude stand-in (the real chunked delta
+rule is not replicated).
+
 Ported from the ONYX ``_MinimalHybridDecoderLayer`` /
 ``_MinimalHybridTextModel`` (Apache-2.0), which solves the same problem for
 the same architectures.
@@ -32,8 +43,49 @@ from typing import Any, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
+
+
+class MinimalRMSNorm(nn.Module):
+    """Qwen3.5-style ZERO-CENTRED RMSNorm: ``x / rms(x) * (1 + w)``.
+
+    Matches ``transformers.models.qwen3_5.modeling_qwen3_5.Qwen3_5RMSNorm``
+    (a.k.a. ``RMSNormZeroCentered``): the parameter is initialised to
+    ZEROS and the checkpoint stores deltas around 0, so an identity
+    fill is 0, not 1. Used for input/post-attention/q/k/final norms.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        return (out * (1.0 + self.weight.float())).type_as(x)
+
+
+class MinimalRMSNormGated(nn.Module):
+    """Qwen3.5-style gated RMSNorm for the GDN value path.
+
+    Matches ``Qwen3_5RMSNormGated``: norm first, then multiply by
+    ``silu(gate)``; the weight is a PLAIN scale initialised to ones
+    (not zero-centred -- unlike the plain RMSNorm above).
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        xf = x.float()
+        out = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        out = out * self.weight.float()
+        return (out * F.silu(gate.float())).type_as(x)
 
 
 class MinimalHybridDecoderLayer(nn.Module):
@@ -56,20 +108,37 @@ class MinimalHybridDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
 
         hidden_size = int(config.hidden_size)
-        inter_size = int(getattr(config, "moe_intermediate_size", 512) or 512)
-        num_experts = int(getattr(config, "num_experts", 4) or 4)
-        shared_inter = int(
-            getattr(config, "shared_expert_intermediate_size", inter_size)
-            or inter_size
+        # Dense hybrids (e.g. VeriLoop-E2, ``qwen3_5`` dense) declare a plain
+        # ``intermediate_size`` and no expert count; MoE hybrids declare
+        # ``moe_intermediate_size`` plus an expert count. Pick the layout the
+        # checkpoint actually uses so weight injection lines up 1:1.
+        moe_inter_size = getattr(config, "moe_intermediate_size", None)
+        num_experts = int(
+            getattr(config, "num_experts", None)
+            or getattr(config, "n_routed_experts", None)
+            or getattr(config, "num_local_experts", None)
+            or 0
         )
+        dense_inter_size = getattr(config, "intermediate_size", None)
+        if num_experts >= 2 and moe_inter_size:
+            self.mlp_is_dense = False
+            inter_size = int(moe_inter_size)
+            shared_inter = int(
+                getattr(config, "shared_expert_intermediate_size", inter_size)
+                or inter_size
+            )
+        else:
+            self.mlp_is_dense = True
+            inter_size = int(dense_inter_size or 4 * hidden_size)
+            shared_inter = inter_size  # unused in the dense path
         n_heads = int(getattr(config, "num_attention_heads", 1) or 1)
         n_kv = int(getattr(config, "num_key_value_heads", n_heads) or n_heads)
         head_dim = int(
             getattr(config, "head_dim", None) or (hidden_size // n_heads)
         )
 
-        self.input_layernorm = nn.LayerNorm(hidden_size)
-        self.post_attention_layernorm = nn.LayerNorm(hidden_size)
+        self.input_layernorm = MinimalRMSNorm(hidden_size)
+        self.post_attention_layernorm = MinimalRMSNorm(hidden_size)
 
         if layer_type == "full_attention":
             self._build_attention(hidden_size, n_heads, n_kv, head_dim, config)
@@ -113,8 +182,8 @@ class MinimalHybridDecoderLayer(nn.Module):
         # o_proj consumes the attention width, not the gated q_proj width:
         # the checkpoint's o_proj is [hidden, attn_width].
         self.self_attn.o_proj = nn.Linear(attn_width, hidden_size, bias=False)
-        self.self_attn.q_norm = nn.LayerNorm(head_dim)
-        self.self_attn.k_norm = nn.LayerNorm(head_dim)
+        self.self_attn.q_norm = MinimalRMSNorm(head_dim)
+        self.self_attn.k_norm = MinimalRMSNorm(head_dim)
 
     def _build_linear_attention(self, hidden_size: int, config: Any) -> None:
         """Declare the GatedDeltaNet block projections.
@@ -150,7 +219,7 @@ class MinimalHybridDecoderLayer(nn.Module):
             qkv_out, qkv_out, kernel_size=conv_kernel,
             padding=conv_kernel - 1, groups=qkv_out, bias=False,
         )
-        lin.norm = nn.LayerNorm(value_dim)
+        lin.norm = MinimalRMSNormGated(value_dim)
         # A_log / dt_bias are 1-D parameters, not Linear layers.
         self.register_buffer(
             "A_log", torch.zeros(num_v_heads), persistent=False
@@ -169,9 +238,19 @@ class MinimalHybridDecoderLayer(nn.Module):
         num_experts: int,
         config: Any,
     ) -> None:
-        """Declare the MoE block: the router, the experts, the shared expert.
+        """Declare the MoE block (or the dense SwiGLU block).
+
+        Dense checkpoints get ``mlp.{gate,up,down}_proj`` -- the plain
+        Qwen-style FFN -- so that ``_inject_weights`` finds a module for
+        every checkpoint tensor instead of silently zero-filling a MoE
+        hierarchy that the dense weights can never populate.
         """
         self.mlp = nn.Module()
+        if getattr(self, "mlp_is_dense", False):
+            self.mlp.gate_proj = nn.Linear(hidden_size, inter_size, bias=False)
+            self.mlp.up_proj = nn.Linear(hidden_size, inter_size, bias=False)
+            self.mlp.down_proj = nn.Linear(inter_size, hidden_size, bias=False)
+            return
         self.mlp.gate = nn.Linear(hidden_size, num_experts, bias=False)
         # The experts are declared as a ModuleList of gate/up/down triples,
         # matching the per-expert checkpoint layout
@@ -261,15 +340,24 @@ class MinimalHybridDecoderLayer(nn.Module):
             # Only the V part of the fused QKV feeds the SSM.
             v_part = conv[..., -self._lin_value_total :]
             state = (v_part + a_exp) * torch.sigmoid(b_exp)
-            # The norm is per value-head, so reshape to heads first.
+            # The norm is per value-head (gated RMSNorm with a silu
+            # gate -- matching Qwen3_5RMSNormGated), so reshape to heads
+            # first and pass the raw z as the gate.
             normed = lin.norm(
-                state.reshape(*state.shape[:-1], n_val, value_dim)
+                state.reshape(*state.shape[:-1], n_val, value_dim),
+                z.reshape(*state.shape[:-1], n_val, value_dim),
             ).reshape(*state.shape)
-            gated = normed * torch.sigmoid(z)
-            hidden_states = hidden_states + lin.out_proj(gated)
+            hidden_states = hidden_states + lin.out_proj(normed)
 
-        # The MoE block: route the tokens, run the experts that were used.
+        # The MLP block. Dense layers run the plain SwiGLU; MoE layers
+        # route the tokens and run the experts that were used.
         mlp = self.mlp
+        if getattr(self, "mlp_is_dense", False):
+            dense_out = mlp.down_proj(
+                torch.nn.functional.silu(mlp.gate_proj(hidden_states))
+                * mlp.up_proj(hidden_states)
+            )
+            return hidden_states + self.post_attention_layernorm(dense_out)
         router = mlp.gate(hidden_states)
         weights = torch.softmax(router.float(), dim=-1)
         top = weights.argmax(dim=-1)
@@ -315,7 +403,7 @@ class MinimalHybridTextModel(nn.Module):
             self.layers.append(
                 MinimalHybridDecoderLayer(config, layer_type, len(self.layers))
             )
-        self.norm = nn.LayerNorm(int(config.hidden_size))
+        self.norm = MinimalRMSNorm(int(config.hidden_size))
 
     def forward(
         self,
