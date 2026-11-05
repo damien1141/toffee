@@ -57,11 +57,21 @@ python -m toffee align --model ./model --dataset ./pairs --method dpo
 python -m toffee merge --model ./model --adapter ./a --weight 0.7 --adapter ./b --weight 0.3 --gguf
 ```
 
-### Speculative decoding
+### Speculative decoding (xspark v2)
+
+Runtime-faithful draft training for ik_llama.cpp — two variants:
+
+- **dspark** — parallel backbone + Markov bigram head (`--spec-type dspark`)
+- **dflash2** — backbone + two-tap dynamic convolutions + candidate-selector
+  lattice, Inco's DFlash2 design (`--spec-type dflash`)
 
 ```bash
-python -m toffee xspark run-all --model ./model --target-gguf ./model-q4km.gguf --samples 1000
+python -m toffee xspark run-all --model ./model --target-gguf ./model-q4km.gguf \
+  --variant dflash2 --samples 2000
 ```
+
+See [XSPARK.md](XSPARK.md) for the architecture, the ik_llama.cpp GGUF
+contract, and the offline acceptance evaluator.
 
 ## Hardware awareness
 
