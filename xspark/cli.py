@@ -13,6 +13,7 @@ Subcommands:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +30,7 @@ try:
         processors=[
             structlog.processors.add_log_level,
             structlog.processors.TimeStamper(fmt="iso"),
-            structlog.JSONRenderer(),
+            structlog.processors.JSONRenderer(),
         ],
         wrapper_class=structlog.make_filtering_bound_logger(0),
         context_class=dict,
@@ -46,11 +47,22 @@ def _parse_target_layers(spec: str, num_layers: int) -> List[int]:
     spec = spec.strip()
     if spec == "auto" or spec == "":
         n = 5
-        return [max(0, (num_layers * i) // (n + 1) - 1) for i in range(1, n + 1)]
-    if "," in spec:
-        return [int(x) for x in spec.split(",")]
-    n = int(spec)
-    return [max(0, (num_layers * i) // (n + 1) - 1) for i in range(1, n + 1)]
+    elif "," in spec:
+        ids = sorted({int(x) for x in spec.split(",")})
+        if not ids:
+            raise ValueError("--target-layers produced an empty layer list")
+        return ids
+    else:
+        n = int(spec)
+    if n < 1:
+        raise ValueError(
+            f"--target-layers count must be >= 1 (got {n!r}); for explicit "
+            "0-based ids use the comma form, e.g. '6,12,18,24,30'")
+    # 5 evenly spaced interior layers (deduped for very small models)
+    ids = sorted({max(0, (num_layers * i) // (n + 1) - 1) for i in range(1, n + 1)})
+    if not ids:
+        raise ValueError("--target-layers produced an empty layer list")
+    return ids
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -77,6 +89,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_harvest.add_argument("--target-layers", type=str, default="auto",
                            help="'auto', a count like '5', or comma-separated 0-based ids")
     p_harvest.add_argument("--balance-domains", action="store_true", default=True)
+    p_harvest.add_argument("--vram-limit", type=float, default=None,
+                           help="GPU budget in GB for one streamed layer + activations "
+                                "(allocator-capped; fp32 layers auto-downcast to bf16 "
+                                "to fit, like the other toffee modules)")
+    p_harvest.add_argument("--ram-budget", type=float, default=None,
+                           help="system-RAM budget in GB per sample chunk "
+                                "(default: 45%% of installed RAM, capped at 8 GB)")
+    p_harvest.add_argument("--dtype", type=str, default="auto",
+                           choices=["auto", "bf16", "fp16", "fp32"],
+                           help="compute dtype for the streamed layers "
+                                "(auto = checkpoint dtype, recommended)")
 
     # train
     p_train = subparsers.add_parser("train", help="Train the draft head")
@@ -107,6 +130,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_train.add_argument("--conv-group-size", type=int, default=16)
     p_train.add_argument("--mask-token-id", type=int, default=None)
     p_train.add_argument("--val-fraction", type=float, default=0.05)
+    p_train.add_argument("--vram-limit", type=float, default=None,
+                         help="GPU budget in GB for training (allocator cap; "
+                              "the frozen embed/lm_head are kept in bf16 and "
+                              "the draft FFN width/depth auto-shrink to fit, "
+                              "like the other toffee modules)")
 
     # export
     p_export = subparsers.add_parser("export", help="Export head to GGUF")
@@ -116,7 +144,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--output", type=str, default=None)
     p_export.add_argument("--mask-token-id", type=int, default=None)
     p_export.add_argument("--self-contained", action="store_true")
-    p_export.add_argument("--dtype", type=str, default="f32", choices=["f32", "f16", "bf16"])
+    p_export.add_argument("--dtype", type=str, default="f32", choices=["f32", "f16", "bf16"],
+                          help="storage dtype for 2-D matmul weights; 1-D tensors "
+                               "and conv bases always stay F32 (ik_llama.cpp "
+                               "kernel requirement)")
+    p_export.add_argument("--quant", type=str, default="none",
+                          choices=["none", "q8", "q8_0", "q6", "q6_k"],
+                          help="block-quantize 2-D matmul weights at export: "
+                               "q8_0 ~53%% of F16 size (near-lossless), q6_k "
+                               "~41%%; get_rows tensors (selector_*, "
+                               "token_embd) cap at Q8_0 (CUDA kernel has no "
+                               "k-quant path); markov_w1 (dspark) never "
+                               "quantized")
 
     # eval
     p_eval = subparsers.add_parser("eval", help="Offline acceptance evaluation")
@@ -126,6 +165,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--anchors", type=int, default=256)
     p_eval.add_argument("--block-size", type=int, default=None)
     p_eval.add_argument("--json-out", type=str, default=None)
+    p_eval.add_argument("--quant", type=str, default="none",
+                        choices=["none", "q8", "q8_0", "q6", "q6_k"],
+                        help="fake-quantize the head's 2-D weights (same policy "
+                             "as export) before evaluating, to measure the "
+                             "acceptance impact of a quantized GGUF")
 
     # run-all
     p_all = subparsers.add_parser("run-all", help="Run harvest -> train -> export")
@@ -148,6 +192,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--alpha-selector", type=float, default=1.0)
     p_all.add_argument("--mask-token-id", type=int, default=None)
     p_all.add_argument("--dtype", type=str, default="f32", choices=["f32", "f16", "bf16"])
+    p_all.add_argument("--quant", type=str, default="none",
+                       choices=["none", "q8", "q8_0", "q6", "q6_k"],
+                       help="block-quantize 2-D matmul weights in the export pass")
+    p_all.add_argument("--vram-limit", type=float, default=None,
+                       help="GPU budget in GB (harvest: one streamed layer; "
+                            "train: allocator cap + draft auto-fit)")
+    p_all.add_argument("--ram-budget", type=float, default=None,
+                       help="system-RAM budget in GB per sample chunk (harvest pass)")
+    p_all.add_argument("--harvest-dtype", type=str, default="auto",
+                       choices=["auto", "bf16", "fp16", "fp32"],
+                       help="compute dtype for the streamed layers (harvest pass)")
 
     return parser
 
@@ -182,8 +237,15 @@ def _train_overrides(parsed) -> dict:
 
 
 def main(args: Optional[List[str]] = None) -> None:
+    if args is None:
+        args = sys.argv[1:]
+    if args and args[0] == "xspark":   # tolerate 'python -m toffee xspark ...' style tails
+        args = args[1:]
     parser = build_parser()
     parsed = parser.parse_args(args)
+
+    # must land before the first CUDA allocation (fragmentation OOM guard)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     if not parsed.command:
         parser.print_help()
@@ -227,6 +289,9 @@ def main(args: Optional[List[str]] = None) -> None:
             batches=batches,
             output_dir=Path(parsed.output_dir),
             target_layers=target_layers,
+            vram_limit_gb=parsed.vram_limit,
+            ram_budget_gb=parsed.ram_budget,
+            dtype=parsed.dtype,
         )
         logger.info("harvest_complete", output_dir=parsed.output_dir)
 
@@ -252,6 +317,7 @@ def main(args: Optional[List[str]] = None) -> None:
             params=params,
             variant=parsed.variant,
             config_overrides=_train_overrides(parsed),
+            vram_limit_gb=parsed.vram_limit,
         )
 
     elif command == "export":
@@ -264,6 +330,7 @@ def main(args: Optional[List[str]] = None) -> None:
             mask_token_id=parsed.mask_token_id,
             self_contained=parsed.self_contained,
             dtype=parsed.dtype,
+            quant=parsed.quant,
         )
         logger.info("export_complete")
 
@@ -276,6 +343,7 @@ def main(args: Optional[List[str]] = None) -> None:
             data_dir=parsed.data_dir,
             max_anchors=parsed.anchors,
             block_size=parsed.block_size,
+            quant=parsed.quant if parsed.quant != "none" else None,
         )
         print(json.dumps(result, indent=2))
         if parsed.json_out:
@@ -310,7 +378,12 @@ def main(args: Optional[List[str]] = None) -> None:
                                    max_length=parsed.seq_len, return_tensors="pt")
                 batches.append({"input_ids": tokens.input_ids,
                                 "attention_mask": tokens.attention_mask})
-            stream_and_harvest(parsed.model, batches, data_dir, target_layers)
+            stream_and_harvest(
+                parsed.model, batches, data_dir, target_layers,
+                vram_limit_gb=parsed.vram_limit,
+                ram_budget_gb=parsed.ram_budget,
+                dtype=parsed.harvest_dtype,
+            )
             save_state(output_dir, AppState(
                 current_pass=1, last_completed_step="harvest_complete",
                 started_at=datetime.now(timezone.utc).isoformat(), model_name=parsed.model))
@@ -330,6 +403,7 @@ def main(args: Optional[List[str]] = None) -> None:
             params=params,
             variant=parsed.variant,
             config_overrides=_train_overrides(parsed),
+            vram_limit_gb=parsed.vram_limit,
         )
         save_state(output_dir, AppState(
             current_pass=2, last_completed_step="train_complete",
@@ -342,6 +416,7 @@ def main(args: Optional[List[str]] = None) -> None:
             target_gguf=parsed.target_gguf,
             mask_token_id=parsed.mask_token_id,
             dtype=parsed.dtype,
+            quant=parsed.quant,
         )
         save_state(output_dir, AppState(
             current_pass=3, last_completed_step="export_complete",

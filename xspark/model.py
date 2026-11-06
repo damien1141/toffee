@@ -189,6 +189,12 @@ class XSparkConfig:
     def __post_init__(self):
         if self.variant not in ("dspark", "dflash2"):
             raise ValueError(f"unknown variant {self.variant!r}")
+        if not (0 <= self.mask_token_id < self.vocab_size):
+            raise ValueError(
+                f"mask_token_id {self.mask_token_id} is outside the target vocab "
+                f"[0, {self.vocab_size}) — the draft would index the shared "
+                "embedding out of range. Pass --mask-token-id with a valid id "
+                "(an unused padding row, or the tokenizer's mask token).")
         if self.variant == "dflash2":
             if self.hidden_size % self.conv_group_size != 0:
                 raise ValueError("hidden_size must be divisible by conv_group_size")
@@ -218,10 +224,15 @@ class XSparkConfig:
         return cls(**json.loads(Path(path).read_text()))
 
 
-def stream_embed_and_lm_head(model_path: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+def stream_embed_and_lm_head(
+    model_path: str, dtype: Optional[torch.dtype] = None
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Stream the target's embedding (and lm_head if untied) from safetensors.
 
     Returns (embed_weight [V, H], lm_head_weight [V, H] or None if tied/absent).
+    Pass dtype=torch.bfloat16 to cast while streaming: this halves both the
+    transient system-RAM peak and the on-GPU footprint of the frozen IO pair,
+    which dominates memory for 200k+-vocab targets.
     """
     import json
 
@@ -259,15 +270,103 @@ def stream_embed_and_lm_head(model_path: str) -> Tuple[torch.Tensor, Optional[to
             if k in w:
                 found[k] = w[k]
 
-    embed = found[embed_key].float()
+    embed = found[embed_key]
+    embed = embed.float() if dtype is None else embed.to(dtype)
     lm_head = found.get(lm_key)
     if lm_head is not None:
-        lm_head = lm_head.float()
+        lm_head = lm_head.float() if dtype is None else lm_head.to(dtype)
         if tuple(lm_head.shape) != tuple(embed.shape):
             logger.warning("lm_head_shape_mismatch", got=tuple(lm_head.shape),
                            expected=tuple(embed.shape))
             lm_head = None
     return embed, lm_head
+
+
+def resolve_mask_token_id(
+    model_path: Optional[str],
+    vocab_size: int,
+    explicit: Optional[int] = None,
+) -> Tuple[int, str]:
+    """Resolve the draft mask token id.
+
+    The mask id only has to satisfy two contracts:
+      1. it indexes a real row of the target embedding (0 <= id < vocab_size)
+      2. train and export agree on it (export defaults to the head's value)
+    Semantically we prefer ids the tokenizer never emits for real text:
+
+        explicit --mask-token-id
+          > tokenizer.json added_tokens (<|mask|>, <mask>, [MASK])
+          > tokenizer_config.json mask_token / mask_token_id
+          > first unused padding row (config vocab_size > real tokenizer vocab;
+            the Qwen family pads 151643 -> 151936, which is why the legacy
+            default of 151669 only ever worked for Qwen targets)
+          > eos_token from tokenizer_config.json
+          > error (ask for --mask-token-id)
+
+    Returns (mask_token_id, source) for logging.
+    """
+
+    def _ok(mid) -> bool:
+        # tolerant: dict -> {"id": ...}; strings ("</s>") are not ids
+        if isinstance(mid, dict):
+            mid = mid.get("id")
+        if isinstance(mid, bool) or not isinstance(mid, int):
+            return False
+        return 0 <= mid < vocab_size
+
+    if explicit is not None:
+        mid = int(explicit)
+        if not _ok(mid):
+            raise ValueError(
+                f"--mask-token-id {mid} is outside the target vocab [0, {vocab_size})")
+        return mid, "explicit"
+
+    if model_path and Path(model_path).is_dir():
+        tok_json = Path(model_path) / "tokenizer.json"
+        tok_data = None
+        real_vocab = None
+        if tok_json.exists():
+            tok_data = json.loads(tok_json.read_text())
+            for a in tok_data.get("added_tokens", []):
+                if a.get("content") in ("<|mask|>", "<mask>", "[MASK]") and _ok(a.get("id")):
+                    return int(a["id"]), "tokenizer.json"
+            # fast-tokenizer format: the vocab lives at model.vocab
+            # (dict for WordLevel/BPE; list of [token, score] for Unigram)
+            mv = (tok_data.get("model") or {}).get("vocab")
+            if mv is None:
+                mv = tok_data.get("vocab")   # legacy/simplified layouts
+            if isinstance(mv, dict):
+                real_vocab = mv
+            elif isinstance(mv, list):
+                real_vocab = {str(t): i for i, (t, _) in enumerate(mv)}
+            # first row past every real token = guaranteed-unused padding row
+            real = len(real_vocab) if real_vocab else 0
+            for a in tok_data.get("added_tokens", []):
+                if "id" in a:
+                    real = max(real, int(a["id"]) + 1)
+            if real < vocab_size:
+                return real, "padding_row"
+
+        tok_cfg_p = Path(model_path) / "tokenizer_config.json"
+        if tok_cfg_p.exists():
+            cfg = json.loads(tok_cfg_p.read_text())
+            mid = cfg.get("mask_token_id") or cfg.get("mask_token")
+            if isinstance(mid, dict):
+                mid = mid.get("id")
+            if _ok(mid):
+                return int(mid), "tokenizer_config"
+            eos = cfg.get("eos_token")
+            if isinstance(eos, str) and real_vocab is not None:
+                # HF writes eos_token as a plain string — look its id up
+                eos = real_vocab.get(eos)
+            elif isinstance(eos, dict):
+                eos = eos.get("id")
+            if _ok(eos):
+                return int(eos), "eos_token"
+
+    raise ValueError(
+        f"Could not resolve a mask token id for vocab_size={vocab_size} from "
+        f"{model_path!r} — pass --mask-token-id explicitly")
 
 
 def infer_config_from_target(target_config, variant: str = "dspark", **overrides) -> XSparkConfig:
@@ -278,10 +377,33 @@ def infer_config_from_target(target_config, variant: str = "dspark", **overrides
         v = getattr(target_config, name, None)
         if v is None:
             v = getattr(text_config, name, None)
+        if v is None and name == "rope_theta":
+            # Qwen3.5-style configs nest the rope params in a dict
+            for src in (target_config, text_config):
+                rp = getattr(src, "rope_parameters", None)
+                if isinstance(rp, dict) and rp.get("rope_theta") is not None:
+                    v = rp["rope_theta"]
+                    break
         return v if v is not None else default
 
     hidden = int(_get("hidden_size", 2048))
     vocab = int(_get("vocab_size", 151936))
+
+    # mask token: explicit > tokenizer-aware resolution > legacy Qwen padding
+    # row (only valid when it fits the vocab; __post_init__ validates)
+    mask_explicit = overrides.pop("mask_token_id", None)
+    if mask_explicit is not None:
+        mask_token_id = int(mask_explicit)
+        mask_src = "explicit"
+    else:
+        model_path = getattr(target_config, "_name_or_path", None)
+        try:
+            mask_token_id, mask_src = resolve_mask_token_id(model_path, vocab)
+        except ValueError:
+            mask_token_id, mask_src = 151669, "legacy_default"
+        logger.info("mask_token_resolved", mask_token_id=mask_token_id,
+                    source=mask_src, vocab_size=vocab)
+
     num_layers_tgt = int(_get("num_hidden_layers", 32))
     heads = int(_get("num_attention_heads", 16))
     head_dim = int(_get("head_dim", hidden // heads))
@@ -308,7 +430,7 @@ def infer_config_from_target(target_config, variant: str = "dspark", **overrides
         rope_base=float(overrides.pop("rope_base", rope_base)),
         rms_eps=rms_eps,
         block_size=int(overrides.pop("block_size", 8)),
-        mask_token_id=int(overrides.pop("mask_token_id", 151669)),
+        mask_token_id=mask_token_id,
         n_target_layers=len(target_layer_ids),
         target_layer_ids=[int(i) for i in target_layer_ids],
         markov_rank=int(overrides.pop("markov_rank", 256)),
@@ -398,20 +520,26 @@ class XSparkDraftModel(nn.Module):
     """
 
     def __init__(self, cfg: XSparkConfig, embed_weight: torch.Tensor,
-                 lm_head_weight: Optional[torch.Tensor] = None):
+                 lm_head_weight: Optional[torch.Tensor] = None,
+                 io_dtype: torch.dtype = torch.float32):
         super().__init__()
         self.cfg = cfg
         H = cfg.hidden_size
 
-        # frozen shared IO (streamed from the target model)
-        self.embed_tokens = nn.Embedding(cfg.vocab_size, H)
-        with torch.no_grad():
-            self.embed_tokens.weight.copy_(embed_weight.to(torch.float32))
-        self.embed_tokens.weight.requires_grad = False
-        self.lm_head = nn.Linear(H, cfg.vocab_size, bias=False)
+        # Frozen shared IO (streamed from the target model), stored in io_dtype.
+        # On CUDA pass torch.bfloat16: the training forward runs under bf16
+        # autocast anyway (fp32 storage merely doubled the footprint through
+        # the autocast weight cache), and the runtime GGUF keeps these tensors
+        # in f16/bf16 regardless — so bf16 is both cheaper and more faithful.
+        # The containers are meta-constructed to avoid transient fp32 [V, H]
+        # allocations while wiring up a 200k+-vocab target.
+        self.embed_tokens = nn.Embedding(cfg.vocab_size, H, device="meta", dtype=io_dtype)
+        self.embed_tokens.weight = nn.Parameter(
+            embed_weight.to(io_dtype), requires_grad=False)
+        self.lm_head = nn.Linear(H, cfg.vocab_size, bias=False, device="meta", dtype=io_dtype)
         if lm_head_weight is not None and tuple(lm_head_weight.shape) == (cfg.vocab_size, H):
-            with torch.no_grad():
-                self.lm_head.weight.copy_(lm_head_weight.to(torch.float32))
+            self.lm_head.weight = nn.Parameter(
+                lm_head_weight.to(io_dtype), requires_grad=False)
             self.tied_lm_head = False
         else:
             self.lm_head.weight = self.embed_tokens.weight  # tied
@@ -479,7 +607,7 @@ class XSparkDraftModel(nn.Module):
 
         # ---- block path ----
         blk_pos = anchor_pos[:, None] + torch.arange(B, device=device)[None, :]   # [A, B]
-        h = self.embed_tokens(block_token_ids)                                     # [A, B, H]
+        h = self.embed_tokens(block_token_ids).to(self.fc.weight.dtype)           # [A, B, H]
 
         allow_ctx = ctx_pos[None, None, None, :] < anchor_pos[:, None, None, None]   # [A, 1, 1, S]
         fmask = torch.zeros(A, 1, B, S + B, dtype=torch.float32, device=device)
@@ -547,8 +675,18 @@ class XSparkDraftModel(nn.Module):
     # ------------------------------------------------------------------
 
     def base_logits(self, h: torch.Tensor) -> torch.Tensor:
-        """h: [..., H] -> logits [..., V] via the frozen target lm_head."""
-        return self.lm_head(self.output_norm(h))
+        """h: [..., H] -> logits [..., V] via the frozen target lm_head (fp32 out)."""
+        return self.lm_head_logits(self.output_norm(h))
+
+    def lm_head_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """h [..., H] -> fp32 logits [..., V] via the frozen lm_head (no norm).
+
+        Dtype-robust: safe with the frozen IO stored in bf16 both inside and
+        outside autocast regions (the matmul runs in the weight's dtype and
+        the result is upcast once, exactly like the runtime readback).
+        """
+        w = self.lm_head.weight
+        return F.linear(h.to(w.dtype), w).float()
 
     def markov_bias(self, prev_ids: torch.Tensor) -> torch.Tensor:
         """prev_ids: [...] int -> [..., V] additive bigram correction."""
@@ -556,7 +694,8 @@ class XSparkDraftModel(nn.Module):
 
     def selector_hidden_proj(self, h: torch.Tensor) -> torch.Tensor:
         """h: [..., H] -> [..., rank] (the H(.) gate, on the output-normed hidden)."""
-        return self.selector_hidden(self.output_norm(h))
+        w = self.selector_hidden.weight
+        return F.linear(self.output_norm(h).to(w.dtype), w)
 
     def selector_scores(
         self,
@@ -707,10 +846,11 @@ class XSparkDraftModel(nn.Module):
     @classmethod
     def load_head(cls, path: Path, embed_weight: torch.Tensor,
                   lm_head_weight: Optional[torch.Tensor] = None,
-                  map_location: str = "cpu") -> "XSparkDraftModel":
+                  map_location: str = "cpu",
+                  io_dtype: torch.dtype = torch.float32) -> "XSparkDraftModel":
         sd = torch.load(path, map_location=map_location, weights_only=False)
         cfg = XSparkConfig(**sd["config"])
-        model = cls(cfg, embed_weight, lm_head_weight)
+        model = cls(cfg, embed_weight, lm_head_weight, io_dtype=io_dtype)
         model.fc.load_state_dict(sd["fc"])
         model.hidden_norm.load_state_dict(sd["hidden_norm"])
         model.layers.load_state_dict(sd["layers"])

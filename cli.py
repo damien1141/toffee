@@ -41,7 +41,8 @@ def _run_quant_command(args: argparse.Namespace) -> None:
 
 def _run_xspark_command(args: argparse.Namespace) -> None:
     from toffee.xspark.cli import main as xspark_main
-    xspark_main(args)
+    # v2 owns its own argparse tree; forward the raw argv tail it captured.
+    xspark_main(list(getattr(args, "xspark_args", None) or []))
 
 
 # Mapping of subcommand to handler functions
@@ -347,68 +348,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_quant_tiers.add_argument("--json", action="store_true",
                                help="Emit the tier table as JSON")
 
-    # xspark
+    # xspark — v2 owns its complete argparse tree (toffee/xspark/cli.py).
+    # Register only a pass-through stub so `toffee --help` lists the command;
+    # main() forwards the raw argv tail directly to the xspark CLI.
     p_xspark = subparsers.add_parser("xspark", help="XSpark speculative decoding draft model")
-    p_xspark_sub = p_xspark.add_subparsers(dest="xspark_command")
-
-    # xspark prepare
-    p_xspark_prep = p_xspark_sub.add_parser("prepare", help="Fetch datasets via HF datasets-server API")
-    p_xspark_prep.add_argument("--out", type=str, default="xspark_data/parquet")
-    p_xspark_prep.add_argument("--only", type=str, default=None)
-    p_xspark_prep.add_argument("--max-rows", type=int, default=None)
-    p_xspark_prep.add_argument("--no-resume", action="store_true")
-
-    # xspark harvest
-    p_xspark_harvest = p_xspark_sub.add_parser("harvest", help="Extract teacher activations")
-    p_xspark_harvest.add_argument("--model", type=str, required=True)
-    p_xspark_harvest.add_argument("--output-dir", type=str, default="xspark_data")
-    p_xspark_harvest.add_argument("--samples", type=int, default=1000)
-    p_xspark_harvest.add_argument("--batch-size", type=int, default=1)
-    p_xspark_harvest.add_argument("--seq-len", type=int, default=2048)
-    p_xspark_harvest.add_argument("--target-layers", type=int, nargs="+", default=[15, 30, 45])
-    p_xspark_harvest.add_argument("--top-k", type=int, default=1000)
-    p_xspark_harvest.add_argument("--balance-domains", action="store_true", default=True)
-
-    # xspark train
-    p_xspark_train = p_xspark_sub.add_parser("train", help="Train XSpark draft head")
-    p_xspark_train.add_argument("--target-model", type=str, required=True)
-    p_xspark_train.add_argument("--data-dir", type=str, default="xspark_data")
-    p_xspark_train.add_argument("--output-dir", type=str, default="xspark_output")
-    p_xspark_train.add_argument("--epochs", type=int, default=3)
-    p_xspark_train.add_argument("--batch-size", type=int, default=1)
-    p_xspark_train.add_argument("--lr", type=float, default=2e-5)
-    p_xspark_train.add_argument("--fp16", action="store_true", default=True)
-    p_xspark_train.add_argument("--num-ctx-layers", type=int, default=2)
-    p_xspark_train.add_argument("--alpha-ce-start", type=float, default=0.3)
-    p_xspark_train.add_argument("--alpha-ce-end", type=float, default=0.05)
-    p_xspark_train.add_argument("--alpha-tv-start", type=float, default=0.5)
-    p_xspark_train.add_argument("--alpha-tv-end", type=float, default=1.0)
-    p_xspark_train.add_argument("--alpha-conf", type=float, default=1.0)
-    p_xspark_train.add_argument("--pos-weight", type=str, default="uniform", choices=["uniform", "survivor", "paper"])
-
-    # xspark export
-    p_xspark_export = p_xspark_sub.add_parser("export", help="Export draft head to GGUF")
-    p_xspark_export.add_argument("--target-model", type=str, required=True)
-    p_xspark_export.add_argument("--xspark-head", type=str, default="xspark_output/xspark_head.pt")
-    p_xspark_export.add_argument("--output-dir", type=str, default="xspark_output")
-    p_xspark_export.add_argument("--block-size", type=int, default=7)
-    p_xspark_export.add_argument("--target-gguf", type=str, required=True)
-
-    # xspark run-all
-    p_xspark_all = p_xspark_sub.add_parser("run-all", help="Run all XSpark passes")
-    p_xspark_all.add_argument("--model", type=str, required=True)
-    p_xspark_all.add_argument("--target-gguf", type=str, required=True)
-    p_xspark_all.add_argument("--output-dir", type=str, default="xspark_output")
-    p_xspark_all.add_argument("--samples", type=int, default=1000)
-    p_xspark_all.add_argument("--batch-size", type=int, default=1)
-    p_xspark_all.add_argument("--seq-len", type=int, default=2048)
-    p_xspark_all.add_argument("--target-layers", type=int, nargs="+", default=[15, 30, 45])
-    p_xspark_all.add_argument("--top-k", type=int, default=1000)
-    p_xspark_all.add_argument("--epochs", type=int, default=3)
-    p_xspark_all.add_argument("--lr", type=float, default=2e-5)
-    p_xspark_all.add_argument("--fp16", action="store_true", default=True)
-    p_xspark_all.add_argument("--num-ctx-layers", type=int, default=2)
-    p_xspark_all.add_argument("--block-size", type=int, default=7)
+    p_xspark.add_argument("xspark_args", nargs=argparse.REMAINDER, metavar="COMMAND",
+                          help="see 'toffee xspark --help'")
 
     return parser
 
@@ -495,6 +440,13 @@ def main() -> None:
         _sub = "prep" if _argv[1] == "canary-prep" else "run"
         raise SystemExit(_canary_main([_sub] + _argv[2:]))
 
+    # `toffee xspark ...` (v2) owns its own argparse tree; forward the raw
+    # flags before this parser's stub can interfere with them.
+    if _argv and _argv[0] == "xspark":
+        from toffee.xspark.cli import main as xspark_main
+        xspark_main(_argv[1:])
+        return
+
     parser = build_parser()
     args = parser.parse_args()
 
@@ -511,6 +463,9 @@ def main() -> None:
     # `amputate plan` / `selftest` / `verify` need no model.
     if args.command == "amputate" and getattr(
             args, "amputate_command", None) in ("plan", "selftest", "verify"):
+        needs_model = False
+    # xspark subcommands define their own --model / --target-model flags.
+    if args.command == "xspark":
         needs_model = False
     if needs_model and not args.model:
         parser.error("--model is required")

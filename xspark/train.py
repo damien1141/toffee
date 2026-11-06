@@ -29,7 +29,9 @@ confidence head is 1 - TV (the exact expected acceptance probability).
 
 from __future__ import annotations
 
+import gc
 import math
+import os
 import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,7 +44,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from toffee.config import AppState
-from toffee.hardware import get_gpu_info
+from toffee.hardware import GPUInfo, get_gpu_info
 from toffee.state import load_state, save_state
 from toffee.xspark.model import (
     XSparkConfig,
@@ -186,7 +188,7 @@ def compute_block_losses(
 
         # ---- TV (exact, full vocab) ----
         with torch.no_grad():
-            teacher_logits = model.lm_head(teacher_h).float()          # [A, V]
+            teacher_logits = model.lm_head_logits(teacher_h)              # [A, V]
         tv = _tv_distance(logp, teacher_logits)                        # [A]
         losses["tv"].append(weight * tv[valid].mean())
         metrics["tv_sum"] += float(tv[valid].sum())
@@ -269,6 +271,158 @@ def compute_block_losses(
 
 
 # ---------------------------------------------------------------------------
+# VRAM planning
+# ---------------------------------------------------------------------------
+
+def _enforce_vram_limit(vram_limit_gb: Optional[float]) -> None:
+    """Cap the CUDA allocator at vram_limit_gb (mirrors harvest/quant)."""
+    if not vram_limit_gb or not torch.cuda.is_available():
+        return
+    total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    if vram_limit_gb >= total:
+        return
+    try:
+        torch.cuda.set_per_process_memory_fraction(vram_limit_gb / total)
+        logger.info("train_vram_limit_enforced",
+                    limit_gb=round(vram_limit_gb, 2), gpu_total_gb=round(total, 2))
+    except Exception as e:  # pragma: no cover — best effort
+        logger.warning("train_vram_limit_failed", error=str(e))
+
+
+def _count_trainable_params(cfg: "XSparkConfig") -> int:
+    """Parameter count of the trainable draft surface (everything the optimizer
+    sees; the frozen embed/lm_head are excluded)."""
+    H, V = cfg.hidden_size, cfg.vocab_size
+    att = cfg.num_heads * cfg.head_dim
+    kv = cfg.num_kv_heads * cfg.head_dim
+    per_layer = (
+        H * (att + 2 * kv)      # q, k, v projections
+        + att * H               # o projection
+        + 2 * cfg.head_dim      # q_norm + k_norm
+        + 2 * H                 # attn_norm + ffn_norm
+        + 3 * H * cfg.intermediate_size   # SwiGLU gate/up/down
+    )
+    if cfg.variant == "dflash2":
+        G = H // cfg.conv_group_size
+        n_proj = 2 * cfg.conv_kernel_size * G
+        per_layer += 2 * H * n_proj              # attn/ffn conv projections
+        per_layer += 4 * cfg.conv_kernel_size * H  # attn/ffn conv bases ([2, K, H])
+    n = cfg.n_target_features * H + 2 * H        # fc + hidden_norm + output_norm
+    n += cfg.num_layers * per_layer
+    if cfg.variant == "dspark":
+        n += V * cfg.markov_rank + cfg.markov_rank * V
+        if cfg.use_confidence_head:
+            n += H + cfg.markov_rank + 1
+    else:
+        n += 2 * V * cfg.selector_rank + H * cfg.selector_rank
+    return n
+
+
+def _plan_train_vram(
+    cfg: "XSparkConfig",
+    params: TrainParams,
+    device: str,
+    gpu: Optional[GPUInfo],
+    vram_limit_gb: Optional[float],
+    untied_lm_head: bool,
+    io_dtype: torch.dtype,
+) -> torch.dtype:
+    """Fit the training run into the GPU budget; returns the trainable dtype.
+
+    Memory model (GiB on device):
+      frozen IO   = (1 + untied) * V * H * io_dtype.itemsize
+      trainable   = N * (param + grad + 2 Adam states + autocast bf16 weight
+                    copies when the params stay fp32)
+      activations ~ ctx/fh + logit buffers + flat reserve
+
+    Only when fp32 params cannot fit does the planner shrink the draft — FFN
+    width first (intermediate_size -> hidden -> hidden/2), then depth — and
+    as a last resort drop the trainable surface to bf16 (the DeepSpec recipe
+    trains its drafts in bf16 full stop). cfg is mutated in place when a
+    shrink is required; every change is logged.
+    """
+    if device != "cuda":
+        return torch.float32
+
+    total_gb = gpu.total_memory_gb if gpu is not None else (
+        torch.cuda.get_device_properties(0).total_memory / (1024 ** 3))
+    budget_gb = (vram_limit_gb or total_gb) - 1.0   # driver + OS + neighbour procs
+
+    V, H = cfg.vocab_size, cfg.hidden_size
+    half_dtype = torch.bfloat16 if (gpu is None or gpu.supports_bf16) else torch.float16
+    frozen_gb = (2 if untied_lm_head else 1) * V * H * io_dtype.itemsize / (1024 ** 3)
+    # ctx (io dtype) + final_hidden (kept fp32) at a typical 2048-token sample,
+    # the [A, V] logit/teacher/softmax buffers, attention workspaces, and a
+    # fragmentation/allocator reserve.
+    act_gb = (
+        1.2
+        + 2048 * (cfg.n_target_features * io_dtype.itemsize + H * 4) / (1024 ** 3)
+        + params.anchors_per_sample * V * 4 * 6 / (1024 ** 3)
+    )
+    trainable_budget = budget_gb - frozen_gb - act_gb
+
+    def _need(n: int, dtype: torch.dtype) -> float:
+        b = dtype.itemsize
+        autocast_cache = 2 if dtype == torch.float32 else 0
+        return n * (4 * b + autocast_cache) / (1024 ** 3)
+
+    if trainable_budget <= 0:
+        raise RuntimeError(
+            f"the frozen embed/lm_head alone (~{frozen_gb:.1f} GiB in "
+            f"{str(io_dtype)}) plus activations (~{act_gb:.1f} GiB) leave nothing "
+            f"under the {budget_gb:.1f} GiB GPU budget for the trainable draft. "
+            "This target's vocab is too large for this GPU; train on a device "
+            "with more VRAM.")
+
+    orig = (cfg.intermediate_size, cfg.num_layers)
+    widths = sorted({w for w in (cfg.intermediate_size, H, H // 2)
+                     if 0 < w <= cfg.intermediate_size}, reverse=True)
+    rungs = [(w, L) for L in range(cfg.num_layers, 0, -1) for w in widths]
+
+    chosen = None
+    for w, L in rungs:
+        cfg.intermediate_size, cfg.num_layers = w, L
+        n = _count_trainable_params(cfg)
+        if _need(n, torch.float32) <= trainable_budget:
+            chosen = (w, L, torch.float32)
+            break
+        if _need(n, half_dtype) <= trainable_budget:
+            chosen = (w, L, half_dtype)
+            break
+    if chosen is None:
+        cfg.intermediate_size, cfg.num_layers = orig
+        n = _count_trainable_params(cfg)
+        raise RuntimeError(
+            f"the {cfg.variant} draft does not fit the GPU budget: even at "
+            f"FFN width {orig[0]} -> {min(widths)} / {rungs[-1][1]} layer(s) in "
+            f"{str(half_dtype)} it needs ~{_need(n, half_dtype):.1f} GiB for the "
+            f"trainable surface but only {trainable_budget:.1f} GiB is left "
+            f"after the frozen IO (~{frozen_gb:.1f} GiB) and activations "
+            f"(~{act_gb:.1f} GiB). Options: raise --vram-limit, pass a smaller "
+            "--intermediate-size / --num-layers, or train on a GPU with more "
+            "VRAM.")
+
+    width, depth, param_dtype = chosen
+    cfg.intermediate_size, cfg.num_layers = width, depth
+    if (width, depth) != orig:
+        logger.warning("train_autofit_shrunk",
+                       old=f"intermediate={orig[0]},layers={orig[1]}",
+                       new=f"intermediate={width},layers={depth}",
+                       reason="draft did not fit the VRAM budget in fp32/bf16",
+                       budget_gb=round(trainable_budget, 2))
+    logger.info("train_vram_plan",
+                gpu_total_gb=round(total_gb, 2),
+                budget_gb=round(budget_gb, 2),
+                frozen_io_gb=round(frozen_gb, 2),
+                activations_gb=round(act_gb, 2),
+                trainable_gb=round(_need(_count_trainable_params(cfg), param_dtype), 2),
+                trainable_params=_count_trainable_params(cfg),
+                io_dtype=str(io_dtype), param_dtype=str(param_dtype),
+                intermediate_size=width, num_layers=depth)
+    return param_dtype
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -280,6 +434,7 @@ def train_xspark(
     variant: str = "dspark",
     config_overrides: Optional[dict] = None,
     resume: bool = True,
+    vram_limit_gb: Optional[float] = None,
 ) -> Path:
     """Train the runtime-faithful draft head (dspark or dflash2)."""
     params = params or TrainParams()
@@ -300,11 +455,37 @@ def train_xspark(
     else:
         logger.warning("train_no_gpu", reason="CPU training will be very slow")
 
-    # ---- frozen shared IO from the target ----
+    # expandable segments avoid the fragmentation OOMs the caching allocator
+    # hits when large frozen tensors and small activations interleave
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    _enforce_vram_limit(vram_limit_gb)
+
+    # ---- frozen shared IO from the target (bf16 on CUDA: the forward runs
+    # under bf16 autocast anyway, so fp32 storage only doubled the footprint
+    # via the autocast weight cache — see model.XSparkDraftModel) ----
     logger.info("streaming_target_io")
-    embed_w, lm_head_w = stream_embed_and_lm_head(target_model)
-    model = XSparkDraftModel(cfg, embed_w, lm_head_w).to(device)
+    if device == "cuda":
+        io_dtype = torch.bfloat16 if (gpu is None or gpu.supports_bf16) else torch.float16
+    else:
+        io_dtype = torch.float32
+    embed_w, lm_head_w = stream_embed_and_lm_head(target_model, dtype=io_dtype)
+
+    # ---- VRAM-aware plan: may shrink cfg.intermediate_size / num_layers,
+    # and picks fp32 vs bf16 trainable params ----
+    param_dtype = _plan_train_vram(cfg, params, device, gpu, vram_limit_gb,
+                                   untied_lm_head=lm_head_w is not None,
+                                   io_dtype=io_dtype)
+
+    model = XSparkDraftModel(cfg, embed_w, lm_head_w, io_dtype=io_dtype)
     del embed_w, lm_head_w
+    gc.collect()
+    if param_dtype != torch.float32:
+        for p_ in model.parameters():
+            if p_.requires_grad:
+                p_.data = p_.data.to(param_dtype)
+    model = model.to(device)
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # ---- data ----
     dataset = XSparkDataset(data_dir)
@@ -359,7 +540,7 @@ def train_xspark(
             block_ids = torch.full((A, cfg.block_size), cfg.mask_token_id, dtype=torch.long)
             block_ids[:, 0] = input_ids[anchors]           # CPU indexing
             anchors = anchors.to(device)
-            ctx = d["ctx"].to(device).float()
+            ctx = d["ctx"].to(device, dtype=amp_dtype if use_amp else torch.float32)
             fh = d["final_hidden"].to(device).float()
             input_ids_d = input_ids.to(device)
 
@@ -405,7 +586,7 @@ def train_xspark(
                     block_ids = torch.full((anchors.shape[0], cfg.block_size), cfg.mask_token_id, dtype=torch.long)
                     block_ids[:, 0] = input_ids[anchors]   # CPU indexing
                     anchors = anchors.to(device)
-                    ctx = d["ctx"].to(device).float()
+                    ctx = d["ctx"].to(device, dtype=amp_dtype if use_amp else torch.float32)
                     fh = d["final_hidden"].to(device).float()
                     with torch.autocast(device_type=device.split(":")[0], dtype=amp_dtype, enabled=use_amp):
                         h = model.forward_blocks(ctx, block_ids.to(device), anchors)

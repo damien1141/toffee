@@ -20,6 +20,10 @@ Metrics (per anchor, averaged):
 Usage:
   python -m toffee.xspark.evalx --head xspark_output/dflash2_head.pt \
       --target-model ./Sage-A1.5 --data-dir xspark_data/harvest --anchors 256
+
+Add ``--quant q8_0``/``--quant q6_k`` to fake-quantize the head's 2-D weights
+(with the exporter's exact per-tensor policy) before evaluating, so the
+reported acceptance includes the quantization error of a quantized GGUF.
 """
 
 from __future__ import annotations
@@ -31,6 +35,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn.functional as F
 
+from toffee.hardware import get_gpu_info
 from toffee.xspark.model import XSparkDraftModel, stream_embed_and_lm_head
 
 try:
@@ -51,10 +56,32 @@ def evaluate(
     batch_anchors: int = 32,
     device: Optional[str] = None,
     seed: int = 1234,
+    quant: Optional[str] = None,
 ) -> Dict[str, float]:
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    embed_w, lm_head_w = stream_embed_and_lm_head(target_model)
-    model = XSparkDraftModel.load_head(head_path, embed_w, lm_head_w).to(device).eval()
+    # frozen IO in bf16 on CUDA: the fp32 embed/lm_head pair of a 200k+-vocab
+    # target is ~8 GB by itself and would OOM 12 GB-class GPUs at eval time;
+    # the walk only needs top-k readback precision, which bf16 provides
+    gpu = get_gpu_info()
+    io_dtype = torch.float32
+    if device == "cuda" and (gpu is None or gpu.supports_bf16):
+        io_dtype = torch.bfloat16
+    embed_w, lm_head_w = stream_embed_and_lm_head(target_model, dtype=io_dtype)
+    model = XSparkDraftModel.load_head(head_path, embed_w, lm_head_w,
+                                       io_dtype=io_dtype)
+    if quant is not None:
+        # pre-flight: apply the exporter's quantization policy in fake-quant
+        # form (quantize -> dequantize, CPU fp32 math) BEFORE moving to the
+        # eval device, so accept_len reflects a quantized GGUF's weights
+        from toffee.xspark.quantize import apply_fake_quant
+        applied = apply_fake_quant(model, quant)
+        worst = max(applied, key=lambda s: s.rel_rmse) if applied else None
+        logger.info("eval_fake_quant", quant=quant, tensors=len(applied),
+                    worst_tensor=worst.name if worst else None,
+                    worst_rel_rmse_pct=round(worst.rel_rmse * 100, 4) if worst else None,
+                    note="acceptance measured against quantized-dequantized "
+                         "2-D weights (same policy as xspark export --quant)")
+    model = model.to(device).eval()
     cfg = model.cfg
     B = block_size or cfg.block_size
     del embed_w, lm_head_w
